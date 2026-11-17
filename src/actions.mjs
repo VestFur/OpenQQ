@@ -82,6 +82,15 @@ export async function dispatchAction(channel, converter, request, options = {}) 
       response = await channel.request(prepared, (action.timeout ?? 15000) + 5000);
       if (!response || !['ok', 'failed'].includes(response.status) || !Number.isSafeInteger(response.retcode)) throw new Error('原生动作回执无效');
       if (response.status === 'ok' && response.retcode !== 0) throw new Error('原生动作回执状态不一致');
+      // CUSTOM_ACTION_UNWRAP（2026-11-18）：native/actions.cjs 里自己实现的动作会返回**一整份 OneBot 回执**
+      // （{status,retcode,data}），而通道会再把它塞进外层 data，于是上层看到 data.data，
+      // 例如 fetch_custom_face_detail 的数组被埋在 data.data.data 里，桥只能报「data 不是数组」。
+      // 这里把内层那份回执摊平：外层 status/retcode/message 用内层的，data 用内层的 data。
+      if (response?.status === 'ok' && response.data && typeof response.data === 'object' && !Array.isArray(response.data)
+          && typeof response.data.status === 'string' && Number.isSafeInteger(response.data.retcode)) {
+        const inner = response.data;
+        response = { status: inner.status, retcode: inner.retcode, data: inner.data ?? null, ...(inner.message ? { message: inner.message } : {}) };
+      }
       if (response.status === 'ok' && action.kind === 'send') {
         response = { status: 'ok', retcode: 0, data: { message_id: converter.messageId(response.data.self, response.data.message) } };
       }
@@ -93,6 +102,8 @@ export async function dispatchAction(channel, converter, request, options = {}) 
       }
     }
   } catch (error) {
+    // Diagnostics: a failed action used to keep only `message`, which hid where it came from.
+    console.error('[dispatch] ' + (error?.stack ?? String(error)));
     response = { status: 'failed', retcode: error.retcode ?? 1500, data: null, message: error.message };
   } finally {
     await release();

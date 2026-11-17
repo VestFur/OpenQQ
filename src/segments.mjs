@@ -32,6 +32,12 @@ export function convertSegment(element, replyId, forward, mediaUrl) {
   if (media) {
     const value = element[media[1]];
     if (!value) return fallback();
+    // Diagnostics: OPENQQ_PTT_DUMP=1 dumps one real ptt element so the outgoing field set
+    // can be matched exactly (QQ 原生层缺一个嵌套对象就只报 Could not convert undefined or null).
+    if (element.elementType === 4 && process.env.OPENQQ_PTT_DUMP === '1' && !globalThis.__openqqPttDumped) {
+      globalThis.__openqqPttDumped = true;
+      try { console.error('[ptt-shape] ' + JSON.stringify(value).slice(0, 1500)); } catch { /* ignore */ }
+    }
     const file = value.fileName || value.md5HexStr || value.fileUuid;
     if (!text(file)) return fallback();
     const data = { file, ...(value.fileUuid ? { file_id: String(value.fileUuid) } : {}) };

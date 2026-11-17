@@ -19,9 +19,9 @@ function md5File(file) {
 }
 
 // Copies a prepared local file into the folder QQ keeps its rich media in, and returns where QQ expects it.
-async function stage(service, source, elementType, fileName) {
+async function stage(service, source, elementType, fileName, method = 'getRichMediaFilePathForGuild') {
   const md5 = await md5File(source);
-  const target = service.getRichMediaFilePathForGuild({ md5HexStr: md5, fileName, elementType, elementSubType: 0, thumbSize: 0,
+  const target = service[method]({ md5HexStr: md5, fileName, elementType, elementSubType: 0, thumbSize: 0,
     needCreate: true, downloadType: 1, file_uuid: '' });
   if (typeof target !== 'string' || !target) throw new Error('QQ 没有返回富媒体存放路径');
   await fs.promises.mkdir(path.dirname(target), { recursive: true });
@@ -61,7 +61,15 @@ function createElementBuilder({ session, ensure, groupCode, memberUid, memberNam
     async record(part) {
       const media = part.media;
       const md5 = await md5File(media.path);
-      const staged = await stage(service(), media.path, ELEMENT.ptt, md5 + '.amr');
+      const fileName = md5 + '.amr';
+      // 语音要按 mobile-send 的登记路径落盘；部分版本的 guild 路径会拒绝 elementType 4。
+      let staged, mobileError;
+      try { staged = await stage(service(), media.path, ELEMENT.ptt, fileName, 'getRichMediaFilePathForMobileQQSend'); }
+      catch (error) { mobileError = error; }
+      if (!staged) {
+        try { staged = await stage(service(), media.path, ELEMENT.ptt, fileName); }
+        catch (error) { throw new Error('语音文件登记失败：mobile=' + (mobileError && mobileError.message) + '；guild=' + error.message); }
+      }
       ensure();
       // The field set mirrors a pttElement QQ itself produced. QQ enumerates the keys of the nested `otherBusinessInfo`
       // while sending, so leaving it out fails with only "Cannot convert undefined or null to object" (issue #7).
