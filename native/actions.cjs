@@ -254,6 +254,13 @@ function createActionHandler(session, self, current, options = {}) {
         for (const args of argShapes) {
           try {
             const value = await target[name](...args);
+            const code = value && typeof value === 'object'
+              ? [value.result, value.errCode, value.retCode].find(v => typeof v === 'number')
+              : undefined;
+            if (typeof code === 'number' && code !== 0) {
+              attempts.push({ name, argc: args.length, nativeCode: code, errMsg: String(value.errMsg || value.message || '') });
+              continue;
+            }
             return { status: 'ok', retcode: 0, data: { action: action.action, via: name, args: args.length, value: value === undefined ? null : value } };
           } catch (error) {
             attempts.push({ name, argc: args.length, error: String(error && error.message ? error.message : error).slice(0, 120) });
@@ -272,8 +279,10 @@ function createActionHandler(session, self, current, options = {}) {
         const msgSvc = session.getMsgService();
         const g = action.group;
         const n = action.count;
-        const result = await tryCall('getLastMessageList(g, n)', () => msgSvc.getLastMessageList(g, n))
-          || await tryCall('getLastMessageList({group:g,count:n})', () => msgSvc.getLastMessageList({ groupCode: g, count: n }))
+        const result = await tryCall('getLastMessageList(g)', () => msgSvc.getLastMessageList(g))
+          || await tryCall('getLastMessageList({groupCode})', () => msgSvc.getLastMessageList({ groupCode: g }))
+          || await tryCall('getLastMessageList(g, n)', () => msgSvc.getLastMessageList(g, n))
+          || await tryCall('getAioLatestMessages(g)', () => msgSvc.getAioLatestMessages(g))
           || await tryCall('getAioLatestMessages(g,n)', () => msgSvc.getAioLatestMessages(g, n));
         if (!result) return { status: 'failed', retcode: 1500, data: { attempts }, message: '群历史没有可用原生方法（见 data.attempts）' };
         const raw = result.value;
@@ -527,6 +536,7 @@ function createActionHandler(session, self, current, options = {}) {
 const COMPAT_ACTIONS = new Set(["can_at_all","can_send_image","can_send_record","delete_custom_face","delete_essence_msg","delete_flash_file","delete_friend","delete_group_file","delete_group_file_folder","delete_group_folder","delete_group_tag","delete_msg","delete_qzone_msg","fetch_custom_face","fetch_custom_face_detail","fetch_emoji_like","fetch_face_entity","fetch_ptt_text","fetch_super_face_id","fetch_sys_faces","get_ai_characters","get_ai_record","get_clientkey","get_collection_list","get_cookies","get_credentials","get_csrf_token","get_doubt_friends_add_request","get_emoji_likes","get_essence_msg_list","get_file","get_fileset_id","get_fileset_info","get_flash_file_list","get_flash_file_url","get_forward_msg","get_friend_list","get_friend_msg_history","get_friends_with_category","get_group_admin_permissions","get_group_admin_settings","get_group_album_list","get_group_album_media_list","get_group_at_all_remain","get_group_detail_info","get_group_file_system_info","get_group_file_url","get_group_files_by_folder","get_group_honor_info","get_group_ignore_add_request","get_group_ignored_notifies","get_group_info","get_group_info_ex","get_group_list","get_group_member_info","get_group_member_list","get_group_msg_history","get_group_root_files","get_group_share_link","get_group_shut_list","get_group_signed_list","get_group_system_msg","get_group_tags","get_group_todo_list","get_image","get_login_info","get_mini_app_ark","get_msg","get_msg_emoji_likes","get_online_clients","get_private_file_url","get_profile_like","get_ptt_text","get_qun_album_list","get_qzone_feed_detail","get_qzone_feeds","get_qzone_home_feeds","get_qzone_msg_detail","get_qzone_msg_list","get_qzone_profile","get_recent_contact","get_record","get_record_text","get_rkey","get_rkey_server","get_share_link","get_status","get_stranger_info","get_unidirectional_friend_list","get_version_info","mark_group_msg_as_read","mark_msg_as_read","mark_private_msg_as_read","send_ark_share","send_custom_face","send_flash_msg","send_forward_msg","send_group_ai_record","send_group_ark_share","send_group_forward_msg","send_group_msg","send_group_sign","send_like","send_msg","send_packet","send_poke","send_private_forward_msg","send_private_msg","send_qzone_msg","send_to_new_members","set_diy_online_status","set_essence_msg","set_friend_add_request","set_friend_remark","set_friends_category","set_group_add_option","set_group_admin","set_group_ban","set_group_card","set_group_kick","set_group_leave","set_group_name","set_group_remark","set_group_special_title","set_group_whole_ban","set_input_status","set_msg_emoji_like","set_online_status","set_qq_avatar","set_qq_profile","set_self_longnick","upload_group_file","upload_private_file","upload_forward_msg"]);
 // 启发式映射已知会猜错的：宁可明确报"待精确实现"，也不返回语义错误的数据。
 const COMPAT_DENY = new Set([
+  'get_profile_like',         // 实测落到 getUserDetailInfo，返回里没有赞数
   'get_group_share_link',   // 换到的是别的方法，语义不对
   'get_group_notice',       // 暂无精确映射
   'get_friend_msg_history', // 与 get_group_msg_history 混用会拿错会话
