@@ -10,6 +10,7 @@ function createSessionHook(report) {
   const generations = new WeakMap();
   const attached = new Map();
   let active = true;
+  let lastReady = null; // 断线重连后重放用
 
   function emit(event) {
     if (!active) return;
@@ -75,7 +76,8 @@ function createSessionHook(report) {
         }
       }
       attachment.ready = true;
-      emit({ type: 'session_ready', self_id: self.uin, services: registrations.map(value => value.source) });
+      lastReady = { self_id: self.uin, services: registrations.map(value => value.source) };
+      emit({ type: 'session_ready', ...lastReady });
     } catch (error) {
       emit({ type: 'hook_error', stage: 'message_listener', error: error.message });
     }
@@ -179,14 +181,23 @@ function createSessionHook(report) {
     if (!active || sessions.length !== 1) throw Object.assign(new Error('需要唯一的已初始化 QQ 会话'), { retcode: 1502 });
     return sessions[0].actions.execute(request);
   }
-  return { hookWrapper, dispose, execute };
+  // 断线重连后重放会话状态：session_ready 只在 QQ 会话初始化时产生一次，
+  // 不重放的话 OpenQQ 侧拿不到 self_id，前置层会判 ready=false、动作全回 1502。
+  function resume() {
+    if (!lastReady) return false;
+    emit({ type: 'session_ready', ...lastReady, resumed: true });
+    return true;
+  }
+
+  return { hookWrapper, dispose, execute, resume };
 }
 
 function startNative(config, wrapper) {
   if (globalThis.__openqq_hook) throw new Error('OpenQQ 已挂接');
-  const socket = require('node:net').createConnection(config.pipe);
+  let socket = null; // 可重连：断线后换新 socket，不再 dispose
   function write(event) {
-    if (socket.writableLength > 1024 * 1024) { connection.dispose(); return; }
+    if (!socket || socket.destroyed) return; // 没连接就丢弃事件，不崩
+    if (socket.writableLength > 1024 * 1024) { return; }
     let frame;
     try {
       frame = JSON.stringify(event, (_key, value) => value instanceof Map ? Object.fromEntries(value)
@@ -205,34 +216,63 @@ function startNative(config, wrapper) {
       disposed = true;
       hook.dispose();
       delete globalThis.__openqq_hook;
-      socket.destroy();
+      if (socket) { try { socket.destroy(); } catch {} }
     },
   };
-  socket.on('close', () => connection.dispose());
-  socket.on('error', () => connection.dispose());
-  socket.setEncoding('utf8');
-  let buffer = '';
   let busy = 0;
-  socket.on('data', chunk => {
-    buffer += chunk;
-    if (Buffer.byteLength(buffer) > 1024 * 1024) { connection.dispose(); return; }
-    for (let end; (end = buffer.indexOf('\n')) !== -1;) {
-      const line = buffer.slice(0, end);
-      buffer = buffer.slice(end + 1);
-      let frame;
-      try {
-        frame = JSON.parse(line);
-        if (frame?.type !== 'action' || !/^[a-f0-9]{32}$/.test(frame.id) || busy >= 32) throw new Error('无效动作帧');
-      } catch { connection.dispose(); return; }
-      busy++;
-      hook.execute(frame.request).then(data => {
-        if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'ok', retcode: 0, data } });
-      }, error => {
-        if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'failed', retcode: error.retcode ?? 1500, data: null, message: error.message } });
-      }).finally(() => { busy--; });
-    }
-  });
-  socket.write(JSON.stringify({ type: 'hello', token: config.token, pid: process.pid }) + '\n');
+  let gen = 0;
+  let retryTimer = null;
+  // 重连间隔：要明显短于服务端等 QQ 连回来的窗口（默认 6 秒），又不至于空转。
+  const reconnectMs = 300;
+
+  function scheduleReconnect() {
+    if (disposed || retryTimer) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (disposed) return;
+      try { connect(); } catch { scheduleReconnect(); }
+    }, reconnectMs);
+    if (retryTimer.unref) retryTimer.unref();
+  }
+
+  function connect() {
+    if (disposed) return;
+    const s = require('node:net').createConnection(config.pipe);
+    const my = ++gen;
+    socket = s;
+    // 新连接上没有任何在途动作，计数归零；否则断线时若正好压着 32 个，重连后会一直被拒帧。
+    busy = 0;
+    s.on('close', () => { if (my === gen) scheduleReconnect(); });
+    s.on('error', () => { try { s.destroy(); } catch { /* 交给 close 去重连 */ } });
+    s.setEncoding('utf8');
+    let buffer = '';
+    s.on('data', chunk => {
+      if (my !== gen) return;
+      buffer += chunk;
+      if (Buffer.byteLength(buffer) > 1024 * 1024) { try { s.destroy(); } catch { /* 帧过大，断开等重连 */ } return; }
+      for (let end; (end = buffer.indexOf('\n')) !== -1;) {
+        const line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        let frame;
+        try {
+          frame = JSON.parse(line);
+          if (frame?.type !== 'action' || !/^[a-f0-9]{32}$/.test(frame.id) || busy >= 32) throw new Error('无效动作帧');
+        } catch { try { s.destroy(); } catch { /* 收到坏帧，断开等重连 */ } return; }
+        busy++;
+        hook.execute(frame.request).then(data => {
+          if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'ok', retcode: 0, data } });
+        }, error => {
+          if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'failed', retcode: error.retcode ?? 1500, data: null, message: error.message } });
+        }).finally(() => { busy--; });
+      }
+    });
+    s.write(JSON.stringify({ type: 'hello', token: config.token, pid: process.pid }) + '\n');
+    // 必须是同一个 socket 上顺序写：服务端先读完 hello 完成认证，才会把这个帧当事件处理。
+    // 首次注入时 QQ 会话还没初始化，resume() 返回 false，等它自己上报 session_ready。
+    try { hook.resume(); } catch { /* 会话尚未就绪 */ }
+  }
+
+  connect();
   globalThis.__openqq_hook = connection;
   try { return hook.hookWrapper(wrapper); }
   catch (error) { connection.dispose(); throw error; }
