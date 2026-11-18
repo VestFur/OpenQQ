@@ -42,8 +42,8 @@ export function convertSegment(element, replyId, forward, mediaUrl) {
     if (!text(file)) return fallback();
     // QQ 客户端开过「语音转文字」时，pttElement.text 就是转写结果——入站直接透给上层，
     // 比另跑 STT 便宜得多；出站不需要它。
-    const text = typeof value.text === 'string' ? value.text.trim() : '';
-    const data = { file, ...(value.fileUuid ? { file_id: String(value.fileUuid) } : {}), ...(text ? { text } : {}) };
+    const pttText = typeof value.text === 'string' ? value.text.trim() : '';
+    const data = { file, ...(value.fileUuid ? { file_id: String(value.fileUuid) } : {}), ...(pttText ? { text: pttText } : {}) };
     const localPath = firstPath(value);
     if (localPath) data.path = localPath;
     if (text(value.originImageUrl) && /^https?:\/\//.test(value.originImageUrl)) data.url = value.originImageUrl;

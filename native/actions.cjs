@@ -120,7 +120,7 @@ function validateAction(request) {
   if (request.action === 'get_group_honor_info') throw fail('getGroupHonorList 的 groupUin/groupCode/group_id/位置参数全部回 errCode 20000 param(group_id) error，需要原生结构体，暂不实现', 1404);
   if (request.action === 'get_essence_msg_list') return { kind: 'essence', group: identifier(params.group_id, 'group_id') };
   if (request.action === 'send_poke') {
-    return { kind: 'poke', target: identifier(params.user_id ?? params.group_id, 'user_id') };
+    throw fail('send_poke 还没实现：QQ 的拍一拍走 OIDB 3795（OidbSvcTrpcTcp.0xed3_1），不是消息元素；元素式 grayTip 发得出去但客户端不渲染。等拿到真实入站样本再补', 1404);
   }
   if (request.action === 'download_rich_media') {
     const fileUuid = String(params.file_id ?? params.fileUuid ?? params.uuid ?? '');
@@ -130,9 +130,6 @@ function validateAction(request) {
   }
   if (request.action === 'get_group_msg_history') {
     return { kind: 'group_history', group: identifier(params.group_id, 'group_id'), count: Math.min(200, Math.max(1, Number(params.count ?? 20))) };
-  }
-  if (request.action === 'set_friend_add_request') {
-    return { kind: 'friend_request', flag: String(params.flag ?? ''), approve: params.approve !== false, remark: String(params.remark ?? '') };
   }
   if (request.action === 'fetch_custom_face_detail') {
     const count = Number(params.count ?? 48);
@@ -253,6 +250,7 @@ function createActionHandler(session, self, current, options = {}) {
       argShapes.push(Object.values(p));
       if (Object.keys(p).length === 1) argShapes.push([Object.values(p)[0]]);
       for (const name of names) {
+        ensure();
         for (const args of argShapes) {
           try {
             const value = await target[name](...args);
@@ -264,7 +262,7 @@ function createActionHandler(session, self, current, options = {}) {
       }
       return { status: 'failed', retcode: 1500, data: { action: action.action, candidates: names, attempts: attempts.slice(0, 8) }, message: '没有可用的原生方法（见 data.attempts）' };
     }
-    if (action.kind === 'poke' || action.kind === 'group_history' || action.kind === 'friend_request' || action.kind === 'upload') {
+    if (action.kind === 'group_history') {
       const attempts = [];
       const tryCall = async (label, fn) => {
         try { const value = await fn(); attempts.push({ label, ok: true }); return { value }; }
@@ -282,54 +280,6 @@ function createActionHandler(session, self, current, options = {}) {
         const list = Array.isArray(raw) ? raw : (raw && (raw.messages ?? raw.msgList ?? raw.list)) || [];
         return { status: 'ok', retcode: 0, data: { attempts, count: Array.isArray(list) ? list.length : null, messages: list, raw_shape: raw && typeof raw === 'object' ? Object.keys(raw) : null } };
       }
-      if (action.kind === 'friend_request') {
-        const buddy = session.getBuddyService();
-        const result = await tryCall('approvalFriendRequest', () => buddy.approvalFriendRequest({ friendUid: action.flag, isAgree: action.approve, remark: action.remark }))
-          || await tryCall('approvalDoubtBuddyReq', () => buddy.approvalDoubtBuddyReq({ reqUid: action.flag, isAgree: action.approve }))
-          || await tryCall('setFriendAddRequest', () => buddy.setFriendAddRequest(action.flag, action.approve ? 1 : 2, action.remark));
-        if (!result) return { status: 'failed', retcode: 1500, data: { attempts }, message: '好友请求没有可用原生方法（见 data.attempts）' };
-        return { status: 'ok', retcode: 0, data: { attempts, result: result.value ?? null } };
-      }
-      if (action.kind === 'upload') {
-        const msgSvc = session.getMsgService();
-        const p = action.params || {};
-        const result = await tryCall('uploadFile', () => msgSvc.uploadFile(p))
-          || await tryCall('uploadGroupFile', () => session.getGroupService().uploadGroupFile(p))
-          || await tryCall('uploadPrivateFile', () => session.getGroupService().uploadPrivateFile(p));
-        if (!result) return { status: 'failed', retcode: 1500, data: { attempts }, message: '文件上传没有可用原生方法（见 data.attempts）' };
-        return { status: 'ok', retcode: 0, data: { attempts, result: result.value ?? null } };
-      }
-      // poke：协议里是 elementType 8 的 grayTip，busiId '1061'，jsonStr.items 里放两个 uid（操作者 + 被戳者）。
-      // 没有真实样本时按候选结构逐个试，并把 attempts 原样返回，这样一次重启就能把可能性试完。
-      const msgSvc = session.getMsgService();
-      // 注意：不能调 needUid —— 它定义在本函数更靠后的位置，在这里调用会踩 TDZ
-      // （实测报 `Cannot access 'R' before initialization`）。所以就地做一次 uin→uid。
-      const localUid = async (uin) => {
-        try { const v = (await session.getUixConvertService().getUid([uin]))?.uidInfo?.get?.(uin); if (v) return v; } catch { /* 换下一种 */ }
-        try { const v = (await session.getProfileService().getUidByUin('FriendsServiceImpl', [uin]))?.get?.(uin); if (v) return v; } catch { /* 换下一种 */ }
-        try { const v = (await session.getGroupService().getUidByUins([uin]))?.uids?.get?.(uin); if (v) return v; } catch { /* 换下一种 */ }
-        return '';
-      };
-      const targetUid = await localUid(String(action.target));
-      const selfUid = self.uid || (await localUid(String(self.uin)));
-      if (!targetUid) return { status: 'failed', retcode: 1500, data: { targetUid, selfUid }, message: '无法把被戳对象 QQ 号转换为 UID；未调用发送' };
-      // 实测：sendMsg 的签名是 4 个参数（argc==4）：(msgId, peer, elements, attrs)。
-      const peer = { chatType: 1, peerUid: targetUid, guildId: '' };
-      const gray = (items, tip) => ({ elementType: 8, elementId: '',
-        grayTipElement: { subElementType: tip ? 1 : 0, jsonGrayTipElement: { busiId: '1061', jsonStr: JSON.stringify({ busiId: '1061', ...(tip ? { tip } : {}), items }) } } });
-      const items = [{ uid: selfUid }, { uid: targetUid }];
-      const variants = [
-        { label: 'sendMsg("", peer, [gray], Map)', fn: () => msgSvc.sendMsg('', peer, [gray(items)], new Map()) },
-        { label: 'sendMsg("", peer, [gray], {})', fn: () => msgSvc.sendMsg('', peer, [gray(items)], {}) },
-        { label: 'sendMsg(ts, peer, [gray], Map)', fn: () => msgSvc.sendMsg(String(Date.now()), peer, [gray(items)], new Map()) },
-        { label: 'sendMsg("", peer, [gray tip=1], Map)', fn: () => msgSvc.sendMsg('', peer, [gray(items, 1)], new Map()) },
-        { label: 'sendMsg(peer, [gray], Map, "")', fn: () => msgSvc.sendMsg(peer, [gray(items)], new Map(), '') },
-      ];
-      for (const v of variants) {
-        const result = await tryCall(v.label, v.fn);
-        if (result) return { status: 'ok', retcode: 0, data: { attempts, via: v.label, targetUid, selfUid } };
-      }
-      return { status: 'failed', retcode: 1500, data: { attempts, targetUid, selfUid }, message: '拍一拍没有可用原生方法（见 data.attempts）' };
     }
     if (action.kind === 'rich_media') {
       // 私聊图只有 file_id / rkey，本机没有缓存文件：让 QQ 自己下载一次，再回报落地路径。
@@ -517,6 +467,7 @@ function createActionHandler(session, self, current, options = {}) {
         tag = service.generateMsgUniqueId(action.chatType, time);
         if (typeof tag !== 'string' || !/^[1-9]\d*$/.test(tag) || waiting.has(tag)) throw fail('原生发送关联标识无效或重复，未调用发送', 1500);
         // QQ preserves the caller's guildId tag on ordinary-chat send updates.
+        if (action.kind !== 'send') throw fail('未处理的动作类型: ' + action.kind + '（内部错误，未调用 QQ）', 1404);
         const peer = { chatType: action.chatType, peerUid, guildId: tag };
         const acknowledged = new Promise(resolve => waiting.set(tag, { peer, resolve }));
         const elements = [];
@@ -576,15 +527,14 @@ function createActionHandler(session, self, current, options = {}) {
 const COMPAT_ACTIONS = new Set(["can_at_all","can_send_image","can_send_record","delete_custom_face","delete_essence_msg","delete_flash_file","delete_friend","delete_group_file","delete_group_file_folder","delete_group_folder","delete_group_tag","delete_msg","delete_qzone_msg","fetch_custom_face","fetch_custom_face_detail","fetch_emoji_like","fetch_face_entity","fetch_ptt_text","fetch_super_face_id","fetch_sys_faces","get_ai_characters","get_ai_record","get_clientkey","get_collection_list","get_cookies","get_credentials","get_csrf_token","get_doubt_friends_add_request","get_emoji_likes","get_essence_msg_list","get_file","get_fileset_id","get_fileset_info","get_flash_file_list","get_flash_file_url","get_forward_msg","get_friend_list","get_friend_msg_history","get_friends_with_category","get_group_admin_permissions","get_group_admin_settings","get_group_album_list","get_group_album_media_list","get_group_at_all_remain","get_group_detail_info","get_group_file_system_info","get_group_file_url","get_group_files_by_folder","get_group_honor_info","get_group_ignore_add_request","get_group_ignored_notifies","get_group_info","get_group_info_ex","get_group_list","get_group_member_info","get_group_member_list","get_group_msg_history","get_group_root_files","get_group_share_link","get_group_shut_list","get_group_signed_list","get_group_system_msg","get_group_tags","get_group_todo_list","get_image","get_login_info","get_mini_app_ark","get_msg","get_msg_emoji_likes","get_online_clients","get_private_file_url","get_profile_like","get_ptt_text","get_qun_album_list","get_qzone_feed_detail","get_qzone_feeds","get_qzone_home_feeds","get_qzone_msg_detail","get_qzone_msg_list","get_qzone_profile","get_recent_contact","get_record","get_record_text","get_rkey","get_rkey_server","get_share_link","get_status","get_stranger_info","get_unidirectional_friend_list","get_version_info","mark_group_msg_as_read","mark_msg_as_read","mark_private_msg_as_read","send_ark_share","send_custom_face","send_flash_msg","send_forward_msg","send_group_ai_record","send_group_ark_share","send_group_forward_msg","send_group_msg","send_group_sign","send_like","send_msg","send_packet","send_poke","send_private_forward_msg","send_private_msg","send_qzone_msg","send_to_new_members","set_diy_online_status","set_essence_msg","set_friend_add_request","set_friend_remark","set_friends_category","set_group_add_option","set_group_admin","set_group_ban","set_group_card","set_group_kick","set_group_leave","set_group_name","set_group_remark","set_group_special_title","set_group_whole_ban","set_input_status","set_msg_emoji_like","set_online_status","set_qq_avatar","set_qq_profile","set_self_longnick","upload_group_file","upload_private_file","upload_forward_msg"]);
 // 启发式映射已知会猜错的：宁可明确报"待精确实现"，也不返回语义错误的数据。
 const COMPAT_DENY = new Set([
+  'get_group_share_link',   // 换到的是别的方法，语义不对
+  'get_group_notice',       // 暂无精确映射
+  'get_friend_msg_history', // 与 get_group_msg_history 混用会拿错会话
   'get_group_todo_list',    // 会匹到 getGroupList
   'fetch_sys_faces',        // 会匹到 fetchMarketEmoticonFaceImages（返回 None）
   'get_recent_contact',     // 会匹到 getContactUnreadCnt（未读数不是最近会话）
   'get_online_clients',     // 会匹到 getOnLineDev（原生回 2001002 空）
 ]);
-const COMPAT_ALIAS = {
-  get_friends_with_category: 'get_friend_list',
-  get_friend_msg_history: 'get_private_msg_history',
-};
 // 动作名 → 目标服务
 function compatService(action, session) {
   const a = action;
