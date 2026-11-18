@@ -1,7 +1,7 @@
-import { createServer } from 'node:net';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createConnection, createServer } from 'node:net';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,12 +16,38 @@ function allocateChannelPath() {
   return { path: join(dir, 'ipc.sock'), ownedDir: dir };
 }
 
-export async function createNativeChannel(customPath) {
+// 固定端点：同一份安装每次启动都落到同一个地址，QQ 侧的 session.cjs 断线后才可能重连回来。
+// seed 一般传项目目录，让同一台机器上的多份安装互不冲突。
+export function persistentChannelPath(seed) {
+  const id = createHash('sha256').update(String(seed)).digest('hex').slice(0, 10);
+  if (process.platform === 'win32') return `\\\\.\\pipe\\openqq-${id}`;
+  let base = tmpdir();
+  const runtimeDir = process.env.XDG_RUNTIME_DIR;
+  if (runtimeDir) { try { if (statSync(runtimeDir).isDirectory()) base = runtimeDir; } catch { /* 没这个目录就用 tmpdir */ } }
+  const preferred = join(base, `openqq-${id}.sock`);
+  // Unix domain socket 的 sun_path 上限通常是 104~108 字节，太长会 listen 失败，退到 /tmp。
+  return Buffer.byteLength(preferred) <= 100 ? preferred : join('/tmp', `openqq-${id}.sock`);
+}
+
+// 上次异常退出可能留下 socket 文件。先探一下有没有人真的在听，确认没人再删，
+// 避免把另一个正在服务的实例的端点删掉。
+function clearStaleSocket(path) {
+  try { if (!statSync(path).isSocket()) return Promise.resolve(false); } catch { return Promise.resolve(false); }
+  return new Promise(resolve => {
+    const probe = createConnection(path);
+    probe.once('connect', () => { probe.destroy(); resolve(false); });
+    probe.once('error', () => { try { unlinkSync(path); } catch { /* 删不掉就让 listen 报 EADDRINUSE */ } resolve(true); });
+  });
+}
+
+export async function createNativeChannel(customPath, customToken) {
   const allocated = customPath ? { path: customPath, ownedDir: null } : allocateChannelPath();
   const path = allocated.path;
   const isWindowsPipe = process.platform === 'win32' || path.startsWith('\\\\.\\pipe\\');
+  // 固定端点（调用方给了 customPath）可能残留上次的 socket 文件，listen 前先清掉。
+  if (customPath && !isWindowsPipe) await clearStaleSocket(path);
   const events = new EventEmitter();
-  const token = randomBytes(32).toString('hex');
+  const token = typeof customToken === 'string' && customToken.length >= 32 ? customToken : randomBytes(32).toString('hex');
   const sockets = new Set();
   let authenticated;
   const pending = new Map();
@@ -41,6 +67,8 @@ export async function createNativeChannel(customPath) {
     socket.on('error', () => socket.destroy());
     socket.on('close', () => {
       sockets.delete(socket);
+      // 允许同一端点被下一次连接重新认证；否则 QQ 侧断线重连会被「已认证」挡掉。
+      if (authenticated === socket) authenticated = null;
       if (accepted) { failPending(); events.emit('disconnected'); }
     });
     socket.on('data', chunk => {
