@@ -117,9 +117,6 @@ function validateAction(request) {
   if (['get_login_info', 'get_status'].includes(request.action)) return { kind: request.action };
   if (request.action === 'openqq_services') return { kind: 'services' };
   if (request.action === 'get_friend_list') return { kind: 'friend_list' };
-  if (request.action === 'get_stranger_info') {
-    return { kind: 'stranger', uin: identifier(params.user_id, 'user_id') };
-  }
   if (request.action === 'get_group_honor_info') throw fail('getGroupHonorList 的 groupUin/groupCode/group_id/位置参数全部回 errCode 20000 param(group_id) error，需要原生结构体，暂不实现', 1404);
   if (request.action === 'get_essence_msg_list') return { kind: 'essence', group: identifier(params.group_id, 'group_id') };
   if (request.action === 'send_poke') {
@@ -136,9 +133,6 @@ function validateAction(request) {
   }
   if (request.action === 'set_friend_add_request') {
     return { kind: 'friend_request', flag: String(params.flag ?? ''), approve: params.approve !== false, remark: String(params.remark ?? '') };
-  }
-  if (request.action === 'upload_group_file' || request.action === 'upload_private_file') {
-    throw fail('文件上传暂不提供原生实现：直接转发 params 会绕过 mediaRef 的路径校验，改由前置层翻成 file 段发送', 1404);
   }
   if (request.action === 'fetch_custom_face_detail') {
     const count = Number(params.count ?? 48);
