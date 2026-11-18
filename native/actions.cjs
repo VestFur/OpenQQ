@@ -122,10 +122,6 @@ function validateAction(request) {
   }
   if (request.action === 'get_group_honor_info') throw fail('getGroupHonorList 的 groupUin/groupCode/group_id/位置参数全部回 errCode 20000 param(group_id) error，需要原生结构体，暂不实现', 1404);
   if (request.action === 'get_essence_msg_list') return { kind: 'essence', group: identifier(params.group_id, 'group_id') };
-  if (request.action === 'send_like') throw fail('send_like 的原生实现未接（旧版静默返回 ok+null，已改为明确报错）', 1404);
-  if (COMPAT_ACTIONS.has(request.action) && /^(get|fetch|can)_/.test(request.action) && !['get_login_info','get_status','set_input_status','get_forward_msg','get_image','send_private_msg','send_group_msg','send_msg','get_friend_list','get_stranger_info','fetch_custom_face_detail','get_group_msg_history','set_friend_add_request','send_poke'].includes(request.action)) {
-    return { kind: 'compat', action: request.action, params };
-  }
   if (request.action === 'send_poke') {
     return { kind: 'poke', target: identifier(params.user_id ?? params.group_id, 'user_id') };
   }
@@ -142,7 +138,7 @@ function validateAction(request) {
     return { kind: 'friend_request', flag: String(params.flag ?? ''), approve: params.approve !== false, remark: String(params.remark ?? '') };
   }
   if (request.action === 'upload_group_file' || request.action === 'upload_private_file') {
-    return { kind: 'upload', action: request.action, params };
+    throw fail('文件上传暂不提供原生实现：直接转发 params 会绕过 mediaRef 的路径校验，改由前置层翻成 file 段发送', 1404);
   }
   if (request.action === 'fetch_custom_face_detail') {
     const count = Number(params.count ?? 48);
@@ -167,6 +163,11 @@ function validateAction(request) {
   }
   const managed = admin.validate(request, params);
   if (managed) return managed;
+  // 兼容动作放在 admin.validate 之后：先让精确实现（send_like / 群信息 / 好友事件）拿到机会，
+  // 只处理确认没人管的只读动作，启发式仅限 get/fetch/can 前缀。
+  if (COMPAT_ACTIONS.has(request.action) && /^(get|fetch|can)_/.test(request.action) && !['get_login_info','get_status','set_input_status','get_forward_msg','get_image','send_private_msg','send_group_msg','send_msg','get_friend_list','get_stranger_info','fetch_custom_face_detail','get_group_msg_history','set_friend_add_request'].includes(request.action)) {
+    return { kind: 'compat', action: request.action, params };
+  }
   if (!sendActions.includes(request.action)) throw fail('尚未支持动作: ' + request.action, 1404);
   let type = request.action === 'send_private_msg' ? 'private' : request.action === 'send_group_msg' ? 'group' : params.message_type;
   if (!type) {
@@ -203,6 +204,7 @@ function createActionHandler(session, self, current, options = {}) {
     const ensure = () => { if (disposed || !current() || !operation.active) throw fail('原生会话已失效，动作未继续执行', 1502); };
     ensure();
     if (action.kind === 'services') {
+      if (process.env.OPENQQ_SERVICES !== '1') return { status: 'failed', retcode: 1404, data: null, message: 'openqq_services 会把原生方法列表暴露给任意客户端，默认关闭；本地调试设 OPENQQ_SERVICES=1' };
       const dump = {};
       const names = value => {
         if (!value || (typeof value !== 'object' && typeof value !== 'function')) return [];
@@ -383,12 +385,12 @@ function createActionHandler(session, self, current, options = {}) {
       const pick = value => (value && value.result && value.result.data) || (value && value.data) || value || [];
       const list = pick(raw);
       const arr = Array.isArray(list) ? list : (list?.buddies ?? list?.list ?? []);
-      return { status: 'ok', retcode: 0, data: { args: usedArgs, items: arr.map(item => ({
+      return { status: 'ok', retcode: 0, data: arr.map(item => ({
         user_id: (item?.uin ?? item?.uid ?? null),
         nickname: String(item?.nick ?? item?.nickname ?? ''),
         remark: String(item?.remark ?? item?.cardName ?? ''),
         raw_shape: item && typeof item === 'object' ? Object.keys(item).slice(0, 12) : null,
-      })) } };
+      })) };
     }
     if (action.kind === 'stranger') {
       const detail = await session.getProfileService().getUserDetailInfoByUin(action.uin);
