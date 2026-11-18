@@ -428,6 +428,10 @@ function createEventReceiver(session, self, report, current, { memberRetryMs = M
       native('msg', `empty_message(msgType=${Number(input.msgType)},subMsgType=${Number(input.subMsgType)})`, []);
       return;
     }
+    if (gray && process.env.OPENQQ_GRAYTIP_DUMP !== '0' && !globalThis.__openqqGrayDumped) {
+      globalThis.__openqqGrayDumped = true;
+      try { console.error('[graytip-shape] ' + JSON.stringify(gray).slice(0, 2000)); } catch { /* best effort */ }
+    }
     if (String(gray?.jsonGrayTipElement?.busiId) === '1061') {
       if (input.elements.length !== 1) throw new Error('戳一戳包含非预期的混合元素');
       let data;

@@ -115,12 +115,28 @@ function validateAction(request) {
   const params = request.params ?? {};
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw fail('params 必须为对象');
   if (['get_login_info', 'get_status'].includes(request.action)) return { kind: request.action };
+  if (['get_cookies', 'get_csrf_token', 'get_qzone_feeds', 'get_qzone_home_feeds', 'get_qzone_msg_list', 'get_qzone_profile', 'send_qzone_msg', 'delete_qzone_msg'].includes(request.action)) {
+    return { kind: 'qzone', action: request.action, params };
+  }
+  if (request.action === 'debug_methods') {
+    return { kind: 'debug_methods', service: String(params.service ?? 'msg'), keyword: String(params.keyword ?? ''), limit: Math.min(200, Math.max(1, Number(params.limit ?? 80))) };
+  }
+  if (request.action === 'debug_recent') {
+    // 只读调试口：把某个会话的最近消息捞出来并挑出灰条元素，用来回收已经发生过的拍一拍样本。
+    const group = params.group_id === undefined ? null : identifier(params.group_id, 'group_id');
+    const user = group === null ? identifier(params.user_id, 'user_id') : null;
+    if (group === null && user === null) throw fail('debug_recent 需要 user_id 或 group_id');
+    return { kind: 'debug_recent', group, user, count: Math.min(50, Math.max(1, Number(params.count ?? 20))) };
+  }
   if (request.action === 'openqq_services') return { kind: 'services' };
   if (request.action === 'get_friend_list') return { kind: 'friend_list' };
   if (request.action === 'get_group_honor_info') throw fail('getGroupHonorList 的 groupUin/groupCode/group_id/位置参数全部回 errCode 20000 param(group_id) error，需要原生结构体，暂不实现', 1404);
   if (request.action === 'get_essence_msg_list') return { kind: 'essence', group: identifier(params.group_id, 'group_id') };
   if (request.action === 'send_poke') {
-    throw fail('send_poke 还没实现：QQ 的拍一拍走 OIDB 3795（OidbSvcTrpcTcp.0xed3_1），不是消息元素；元素式 grayTip 发得出去但客户端不渲染。等拿到真实入站样本再补', 1404);
+    const group = params.group_id === undefined ? null : identifier(params.group_id, 'group_id');
+    const user = group === null ? identifier(params.user_id, 'user_id') : (params.user_id === undefined ? null : identifier(params.user_id, 'user_id'));
+    if (group === null && user === null) throw fail('send_poke 需要 user_id 或 group_id');
+    return { kind: 'poke', group, user };
   }
   if (request.action === 'download_rich_media') {
     const fileUuid = String(params.file_id ?? params.fileUuid ?? params.uuid ?? '');
@@ -130,6 +146,9 @@ function validateAction(request) {
   }
   if (request.action === 'get_group_msg_history') {
     return { kind: 'group_history', group: identifier(params.group_id, 'group_id'), count: Math.min(200, Math.max(1, Number(params.count ?? 20))) };
+  }
+  if (request.action === 'get_recent_emoji_list' || request.action === 'get_recent_used_face_list') {
+    return { kind: 'recent_face', what: request.action };
   }
   if (request.action === 'fetch_custom_face_detail') {
     const count = Number(params.count ?? 48);
@@ -232,6 +251,198 @@ function createActionHandler(session, self, current, options = {}) {
       }
       return { status: 'failed', retcode: 1500, data: { action: action.action, attempts }, message: '群荣誉/精华没有可用原生方法（见 data.attempts）' };
     }
+    if (action.kind === 'debug_methods') {
+      const svcMap = { msg: () => session.getMsgService(), buddy: () => session.getBuddyService(), group: () => session.getGroupService(), profile: () => session.getProfileService() };
+      const getter = svcMap[action.service];
+      if (!getter) return { status: 'failed', retcode: 1400, data: { services: Object.keys(svcMap) }, message: 'service 只支持 ' + Object.keys(svcMap).join('/') };
+      const svc = getter();
+      const names = Object.getOwnPropertyNames(Object.getPrototypeOf(svc) || svc).filter(n => typeof n === 'string' && n.includes(action.keyword));
+      return { status: 'ok', retcode: 0, data: { service: action.service, keyword: action.keyword, total: names.length, names: names.slice(0, action.limit) } };
+    }
+    if (action.kind === 'debug_recent') {
+      const msgSvc = session.getMsgService();
+      const attempts = [];
+      const tryCall = async (label, fn) => {
+        try { const value = await fn(); attempts.push({ label, ok: true }); return { value }; }
+        catch (error) { attempts.push({ label, ok: false, error: String(error && error.message ? error.message : error).slice(0, 140) }); return null; }
+      };
+      const chatType = action.group === null ? 1 : 2;
+      const uidOf = async (uin, order) => {
+        for (const name of order) {
+          try {
+            let uid;
+            if (name === 'convert') uid = (await session.getUixConvertService().getUid([uin]))?.uidInfo?.get(uin);
+            else if (name === 'profile') uid = (await session.getProfileService().getUidByUin('FriendsServiceImpl', [uin]))?.get(uin);
+            else uid = (await session.getGroupService().getUidByUins([uin]))?.uids?.get(uin);
+            if (/^u_[\w-]+$/.test(uid ?? '')) return uid;
+          } catch { /* 下一个来源 */ }
+        }
+        return undefined;
+      };
+      const peerUin = action.group === null ? action.user : action.group;
+      const peerUid = action.group === null ? await uidOf(action.user, ['convert', 'profile']) : action.group;
+      if (!peerUid) return { status: 'failed', retcode: 1500, data: { attempts }, message: '无法把 QQ 号转换为 UID' };
+      const peerKey = { chatType, peerUid, guildId: '' };
+      const got = await tryCall('getLastMessageList(peerKey)', () => msgSvc.getLastMessageList(peerKey))
+        || await tryCall('getLastMessageList(peerUid)', () => msgSvc.getLastMessageList(peerUid))
+        || await tryCall('getAioLatestMessages(peerKey)', () => msgSvc.getAioLatestMessages(peerKey))
+        || await tryCall('getAioLatestMessages(peerUid)', () => msgSvc.getAioLatestMessages(peerUid));
+      if (!got) return { status: 'failed', retcode: 1500, data: { attempts }, message: '读最近消息全部失败（见 data.attempts）' };
+      const raw = got.value;
+      let list = Array.isArray(raw) ? raw : (raw && (raw.messages ?? raw.msgList ?? raw.list)) || [];
+      const listType = list && typeof list === 'object' ? (list.constructor ? list.constructor.name : typeof list) : typeof list;
+      if (list && typeof list.values === 'function' && !Array.isArray(list)) list = Array.from(list.values());
+      const grays = [];
+      for (const m of (Array.isArray(list) ? list : [])) {
+        const els = m && m.elements;
+        if (!Array.isArray(els)) continue;
+        for (const el of els) {
+          if (el && el.elementType === 8 && el.grayTipElement) {
+            grays.push({ msgId: m.msgId, msgTime: m.msgTime, grayTipElement: el.grayTipElement });
+          }
+        }
+      }
+      return { status: 'ok', retcode: 0, data: { attempts, chatType, peerUid, count: Array.isArray(list) ? list.length : null,
+        rawKeys: raw && typeof raw === 'object' ? Object.keys(raw) : null, listType, sampleKeys: Array.isArray(list) && list[0] ? Object.keys(list[0]) : null,
+        grayCount: grays.length, grays: grays.slice(0, 5) } };
+    }
+    if (action.kind === 'poke') {
+      // 拍一拍不是消息内容，是 QQ 私有灰条：入站解析（native/events.cjs）认 busiId '1061' + jsonStr.items[].uid。
+      // 出站没有权威 proto，所以按形状逐个试，把每种的 retcode 记下来，一次重启全试完。
+      const attempts = [];
+      const tryCall = async (label, fn) => {
+        try { const value = await fn(); attempts.push({ label, ok: true, value: value === undefined ? null : value }); return { value }; }
+        catch (error) { attempts.push({ label, ok: false, error: String(error && error.message ? error.message : error).slice(0, 160) }); return null; }
+      };
+      const msgSvc = session.getMsgService();
+      const selfUid = self && self.uid ? self.uid : undefined;
+      const selfUin = self && self.uin ? String(self.uin) : undefined;
+      const chatType = action.group === null ? 1 : 2;
+      const uidOf = async (uin, order) => {
+        for (const name of order) {
+          try {
+            let uid;
+            if (name === 'convert') uid = (await session.getUixConvertService().getUid([uin]))?.uidInfo?.get(uin);
+            else if (name === 'profile') uid = (await session.getProfileService().getUidByUin('FriendsServiceImpl', [uin]))?.get(uin);
+            else uid = (await session.getGroupService().getUidByUins([uin]))?.uids?.get(uin);
+            if (/^u_[\w-]+$/.test(uid ?? '')) return uid;
+          } catch { /* 下一个来源 */ }
+        }
+        return undefined;
+      };
+      const peerUid = action.group === null ? await uidOf(action.user, ['convert', 'profile']) : action.group;
+      const targetUid = action.group === null
+        ? peerUid
+        : (action.user === null ? undefined : await uidOf(action.user, ['group', 'convert', 'profile']));
+      if (!peerUid) return { status: 'failed', retcode: 1404, data: { attempts }, message: '无法把 QQ 号转换为 UID；未调用拍一拍' };
+      if (!selfUid) return { status: 'failed', retcode: 1404, data: { attempts }, message: '拍一拍需要自身 UID，当前会话拿不到' };
+      const itemsUid = [{ uid: selfUid }, ...(targetUid ? [{ uid: targetUid }] : [])];
+      const itemsRich = itemsUid.map(x => ({ ...x, ...(selfUin ? { uin: selfUin } : {}) }));
+      const peer = { chatType, peerUid, guildId: '' };
+      const grayOf = jsonStr => [{ elementType: 8, elementId: '', grayTipElement: { jsonGrayTipElement: { busiId: '1061', jsonStr } } }];
+      // 2026-11-18 实测定论（四条都验过）：
+      // ① addLocalJsonGrayTipMsg* 只是本地渲染，QQ 不转发，对方永远看不到；
+      // ② 真身是 msg.sendNudge —— 全服务只有它带 Nudge 语义（send_poke 的另一半 recallNudge 是撤回）；
+      // ③ 原生断言 argc==3，第三参数必须是 number：传 1 通过类型校验，传 0/2/true/false/uid/uin/'' 全部回 result -2；
+      // ④ 即便语法正确，QQ 服务端仍回 result -100（业务侧拒绝，需 aio 上下文或账号权限），所以这里不再盲试一堆形状。
+      const shapes = [
+        ['msg.sendNudge(peerUid, chatType, 1)', () => msgSvc.sendNudge(peerUid, chatType, 1)],
+      ];
+      for (const [label, fn] of shapes) {
+        await tryCall(label, fn);
+        const hit = attempts.some(a => a.ok && a.label.startsWith('msg.sendNudge(') && a.value && typeof a.value === 'object' && Number(a.value.result) === 0);
+        if (hit) break;
+      }
+      const tried = attempts.find(a => a.label.startsWith('msg.sendNudge('));
+      const code = tried && tried.value && typeof tried.value === 'object' ? Number(tried.value.result) : null;
+      if (code === 0) return { status: 'ok', retcode: 0, data: { via: tried.label, value: tried.value, attempts, note: 'msg.sendNudge 返回 result 0；对方端有没有动画要人眼看一次' } };
+      if (code === -100) return { status: 'failed', retcode: 1404, data: { attempts, nativeResult: -100 }, message: 'msg.sendNudge(peerUid, chatType, 1) 语法正确但 QQ 回 result -100：业务侧拒绝（缺 aio 上下文/账号权限），不是参数问题' };
+      return { status: 'failed', retcode: 1404, data: { attempts, nativeResult: code }, message: 'msg.sendNudge 调用被拒（result ' + String(code) + '）' };
+    }
+    if (action.kind === 'qzone') {
+      // 空间/说说走的是 Web API（需要 QQ 的 cookie 与 g_tk），原生这一层只提供 cookike 取用口。
+      const attempts = [];
+      const tryCall = async (label, fn) => {
+        try { const value = await fn(); attempts.push({ label, ok: true }); return { value }; }
+        catch (error) { attempts.push({ label, ok: false, error: String(error && error.message ? error.message : error).slice(0, 140) }); return null; }
+      };
+      const svcList = [
+        ['msf', () => session.getMSFService()], ['msg', () => session.getMsgService()],
+        ['profile', () => session.getProfileService()], ['uix', () => session.getUixConvertService()],
+      ];
+      const want = /cookie|skey|a1|ticket|token|gkey|pass/i;
+      const found = [];
+      for (const [tag, get] of svcList) {
+        let svc;
+        try { svc = get(); } catch { continue; }
+        if (!svc) continue;
+        const proto = Object.getPrototypeOf(svc) || svc;
+        for (const name of Object.getOwnPropertyNames(proto)) {
+          if (!want.test(name)) continue;
+          found.push({ service: tag, name });
+        }
+      }
+      if (action.action === 'get_cookies' || action.action === 'get_csrf_token') {
+        const results = [];
+        for (const f of found) {
+          const svc = svcList.find(x => x[0] === f.service)[1]();
+          for (const args of [[], [String(self.uin)], [Number(self.uin)]]) {
+            const got = await tryCall(f.service + '.' + f.name + '(' + args.length + ')', () => svc[f.name](...args));
+            if (got) { results.push({ ...f, argc: args.length, value: got.value === undefined ? null : got.value }); break; }
+          }
+        }
+        if (action.action === 'get_cookies') return { status: 'ok', retcode: 0, data: { candidates: found, results, attempts } };
+        const skeyEntry = results.find(r => r.value && typeof r.value === 'object' && typeof (r.value.skey ?? r.value.p_skey) === 'string');
+        const skey = skeyEntry ? String(skeyEntry.value.skey ?? skeyEntry.value.p_skey) : '';
+        const gtk = (() => { let h = 5381; for (let i = 0; i < skey.length; i++) h += (h << 5) + skey.charCodeAt(i); return h & 0x7fffffff; })();
+        return { status: skey ? 'ok' : 'failed', retcode: skey ? 0 : 1404, data: { g_tk: gtk, skeyFound: Boolean(skey), results, attempts }, ...(skey ? {} : { message: '拿不到 skey，无法计算 g_tk（见 data.results / attempts）' }) };
+      }
+      // 空间读写：需要 cookie；拿不到就明确失败
+      const cookieEntry = found.find(f => /cookie/i.test(f.name));
+      let cookieText = '';
+      if (cookieEntry) {
+        const svc = svcList.find(x => x[0] === cookieEntry.service)[1]();
+        for (const args of [[], [Number(self.uin)], [String(self.uin)]]) {
+          const got = await tryCall('cookie.' + cookieEntry.name, () => svc[cookieEntry.name](...args));
+          if (got && got.value) { cookieText = typeof got.value === 'string' ? got.value : JSON.stringify(got.value); break; }
+        }
+      }
+      if (!cookieText) return { status: 'failed', retcode: 1404, data: { candidates: found, attempts }, message: '空间操作需要 QQ cookie：没有可用的原生取 cookie 方法（见 data.candidates/attempts）' };
+      const skeyMatch = /skey=([^;]+)/.exec(cookieText) || /p_skey=([^;]+)/.exec(cookieText);
+      const skey = skeyMatch ? skeyMatch[1] : '';
+      const gtk = (() => { let h = 5381; for (let i = 0; i < skey.length; i++) h += (h << 5) + skey.charCodeAt(i); return h & 0x7fffffff; })();
+      const uin = String(self.uin);
+      const headers = { Cookie: cookieText, Referer: 'https://user.qzone.qq.com/' + uin, 'User-Agent': 'Mozilla/5.0' };
+      const p = action.params || {};
+      const num = Math.min(50, Math.max(1, Number(p.count ?? 20)));
+      if (action.action === 'get_qzone_feeds' || action.action === 'get_qzone_msg_list' || action.action === 'get_qzone_home_feeds' || action.action === 'get_qzone_profile') {
+        const pos = Math.max(0, Number(p.pos ?? 0));
+        const url = 'https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6?uin=' + uin +
+          '&ftype=0&sort=0&pos=' + pos + '&num=' + num + '&replynum=0&g_tk=' + gtk + '&code=1&format=json&need_private_comment=1';
+        const res = await fetch(url, { headers });
+        const text = await res.text();
+        let body = null;
+        try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 500) }; }
+        return { status: res.ok ? 'ok' : 'failed', retcode: res.ok ? 0 : 1500, data: { http: res.status, url, body } };
+      }
+      if (action.action === 'send_qzone_msg' || action.action === 'delete_qzone_msg') {
+        const isSend = action.action === 'send_qzone_msg';
+        const content = String(p.message ?? p.content ?? '').trim();
+        if (isSend && !content) return { status: 'failed', retcode: 1400, data: null, message: 'send_qzone_msg 需要 message' };
+        const bodyStr = isSend
+          ? 'con=' + encodeURIComponent(content) + '&feedversion=1&ver=1&to_tweet=0&code=1&format=json&g_tk=' + gtk
+          : 'tid=' + encodeURIComponent(String(p.tid ?? p.feed_id ?? '')) + '&code=1&format=json&g_tk=' + gtk;
+        const url = isSend
+          ? 'https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6'
+          : 'https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6';
+        const res = await fetch(url, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' }, body: bodyStr });
+        const text = await res.text();
+        let body = null;
+        try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 500) }; }
+        return { status: res.ok ? 'ok' : 'failed', retcode: res.ok ? 0 : 1500, data: { http: res.status, url, body } };
+      }
+      return { status: 'failed', retcode: 1404, data: null, message: '未处理的空间动作: ' + action.action };
+    }
     if (action.kind === 'compat') {
       // 只读动作才允许启发式映射；写动作绝不靠猜（会误调 addFriend / addListener 这类有副作用的原生方法）
       if (!/^(get|fetch|can)_/.test(action.action)) {
@@ -279,15 +490,30 @@ function createActionHandler(session, self, current, options = {}) {
         const msgSvc = session.getMsgService();
         const g = action.group;
         const n = action.count;
+        const peerKey = { chatType: 2, peerUid: g, guildId: '' };
         const result = await tryCall('getLastMessageList(g)', () => msgSvc.getLastMessageList(g))
+          || await tryCall('getLastMessageList(peerKey)', () => msgSvc.getLastMessageList(peerKey))
           || await tryCall('getLastMessageList({groupCode})', () => msgSvc.getLastMessageList({ groupCode: g }))
           || await tryCall('getLastMessageList(g, n)', () => msgSvc.getLastMessageList(g, n))
+          || await tryCall('getAioLatestMessages(peerKey)', () => msgSvc.getAioLatestMessages(peerKey))
           || await tryCall('getAioLatestMessages(g)', () => msgSvc.getAioLatestMessages(g))
-          || await tryCall('getAioLatestMessages(g,n)', () => msgSvc.getAioLatestMessages(g, n));
+          || await tryCall('getAioLatestMessages(g,n)', () => msgSvc.getAioLatestMessages(g, n))
+        || await tryCall('getLastMessageList({peerUid,chatType,count})', () => msgSvc.getLastMessageList({ peerUid: g, chatType: 2, count: n }))
+        || await tryCall('getAioLatestMessages({peerUid,chatType,count})', () => msgSvc.getAioLatestMessages({ peerUid: g, chatType: 2, count: n }))
+        || await tryCall('getMsgsBySeqAndCount(peerKey,n)', () => msgSvc.getMsgsBySeqAndCount(peerKey, '0', n, true));
         if (!result) return { status: 'failed', retcode: 1500, data: { attempts }, message: '群历史没有可用原生方法（见 data.attempts）' };
         const raw = result.value;
+        if (raw && typeof raw === 'object' && raw.result !== undefined && Number(raw.result) !== 0) {
+          return { status: 'failed', retcode: 1404, data: { attempts, nativeResult: raw.result, nativeMsg: String(raw.errMsg ?? '') }, message: '原生返回失败码，不是"没有历史"' };
+        }
         const list = Array.isArray(raw) ? raw : (raw && (raw.messages ?? raw.msgList ?? raw.list)) || [];
-        return { status: 'ok', retcode: 0, data: { attempts, count: Array.isArray(list) ? list.length : null, messages: list, raw_shape: raw && typeof raw === 'object' ? Object.keys(raw) : null } };
+        if (raw && typeof raw === 'object' && raw.msgList !== undefined && !Array.isArray(raw.msgList)) {
+          attempts.push({ label: 'msgList-not-array', ok: false, error: typeof raw.msgList });
+        }
+        return { status: 'ok', retcode: 0, data: { attempts, count: Array.isArray(list) ? list.length : null, messages: list,
+          raw_shape: raw && typeof raw === 'object' ? Object.keys(raw) : null,
+          nativeResult: raw && typeof raw === 'object' ? (raw.result ?? null) : null,
+          nativeMsg: raw && typeof raw === 'object' ? String(raw.errMsg ?? '') : null } };
       }
     }
     if (action.kind === 'rich_media') {
@@ -353,10 +579,28 @@ function createActionHandler(session, self, current, options = {}) {
         raw_shape: detail && typeof detail === 'object' ? Object.keys(detail) : null,
       } };
     }
+    if (action.kind === 'recent_face') {
+      const msgSvc = session.getMsgService();
+      const method = action.what === 'get_recent_emoji_list' ? 'getRecentEmojiList' : 'getRecentUsedFaceList';
+      const attempts = [];
+      for (const args of [[], [20], [{ count: 20 }]]) {
+        if (typeof msgSvc[method] !== 'function') { attempts.push({ label: method, error: 'method missing' }); break; }
+        try {
+          const value = await msgSvc[method](...args);
+          const list = Array.isArray(value) ? value : (value && (value.list ?? value.emojiInfoList ?? value.data)) || [];
+          return { status: 'ok', retcode: 0, data: Array.isArray(list) ? list : [], meta: { method, args, shape: value && typeof value === 'object' ? Object.keys(value) : null } };
+        } catch (error) { attempts.push({ label: method + '(' + JSON.stringify(args) + ')', error: String(error && error.message ? error.message : error).slice(0, 120) }); }
+      }
+      return { status: 'failed', retcode: 1404, data: { attempts }, message: method + ' 调用失败（见 data.attempts）' };
+    }
     if (action.kind === 'fav_emoji') {
       const msgSvc = session.getMsgService();
       const n = action.count;
-      const favCandidates = [[n, 0, 0, 0], [n, 0, false, false], [n, 0, 0, false], [n, 0, '', 0], [0, n, 0, 0]];
+      const favCandidates = [
+        [n, 0, 0, 0], [n, 0, false, false], [n, 0, 0, false], [n, 0, '', 0], [0, n, 0, 0],
+        [{ count: n, startIndex: 0 }], [{ count: n }], [{ count: n, start: 0, pageSize: n }],
+        [], [n], [n, 0], [n, 0, 0],
+      ];
       let raw = null;
       let usedFavArgs = null;
       let lastFavError = null;
@@ -390,7 +634,7 @@ function createActionHandler(session, self, current, options = {}) {
       };
       const list = pickEmoji(raw);
       // OneBot v11 expects the emoji list itself as `data`; diagnostics only ride along when the list is empty.
-      return { status: 'ok', retcode: 0, data: list, ...(list.length ? {} : { message: 'fetchFavEmojiList 没有取到表情：args=' + JSON.stringify(usedFavArgs) + ' raw_shape=' + JSON.stringify(raw && typeof raw === 'object' ? Object.keys(raw).slice(0, 12) : null) + ' emojiListType=' + String(describeType(raw && raw.emojiInfoList)) + ' resultType=' + String(describeType(raw && raw.result)) }) };
+      return { status: 'ok', retcode: 0, data: list, ...(list.length ? {} : { message: 'fetchFavEmojiList 没有取到表情：args=' + JSON.stringify(usedFavArgs) + ' raw_shape=' + JSON.stringify(raw && typeof raw === 'object' ? Object.keys(raw).slice(0, 12) : null) + ' totalCnt=' + String(raw && raw.totalCnt) + ' emojiListType=' + String(describeType(raw && raw.emojiInfoList)) + ' resultType=' + String(describeType(raw && raw.result)) }) };
     }
     let timer;
     let tag;
@@ -536,6 +780,14 @@ function createActionHandler(session, self, current, options = {}) {
 const COMPAT_ACTIONS = new Set(["can_at_all","can_send_image","can_send_record","delete_custom_face","delete_essence_msg","delete_flash_file","delete_friend","delete_group_file","delete_group_file_folder","delete_group_folder","delete_group_tag","delete_msg","delete_qzone_msg","fetch_custom_face","fetch_custom_face_detail","fetch_emoji_like","fetch_face_entity","fetch_ptt_text","fetch_super_face_id","fetch_sys_faces","get_ai_characters","get_ai_record","get_clientkey","get_collection_list","get_cookies","get_credentials","get_csrf_token","get_doubt_friends_add_request","get_emoji_likes","get_essence_msg_list","get_file","get_fileset_id","get_fileset_info","get_flash_file_list","get_flash_file_url","get_forward_msg","get_friend_list","get_friend_msg_history","get_friends_with_category","get_group_admin_permissions","get_group_admin_settings","get_group_album_list","get_group_album_media_list","get_group_at_all_remain","get_group_detail_info","get_group_file_system_info","get_group_file_url","get_group_files_by_folder","get_group_honor_info","get_group_ignore_add_request","get_group_ignored_notifies","get_group_info","get_group_info_ex","get_group_list","get_group_member_info","get_group_member_list","get_group_msg_history","get_group_root_files","get_group_share_link","get_group_shut_list","get_group_signed_list","get_group_system_msg","get_group_tags","get_group_todo_list","get_image","get_login_info","get_mini_app_ark","get_msg","get_msg_emoji_likes","get_online_clients","get_private_file_url","get_profile_like","get_ptt_text","get_qun_album_list","get_qzone_feed_detail","get_qzone_feeds","get_qzone_home_feeds","get_qzone_msg_detail","get_qzone_msg_list","get_qzone_profile","get_recent_contact","get_record","get_record_text","get_rkey","get_rkey_server","get_share_link","get_status","get_stranger_info","get_unidirectional_friend_list","get_version_info","mark_group_msg_as_read","mark_msg_as_read","mark_private_msg_as_read","send_ark_share","send_custom_face","send_flash_msg","send_forward_msg","send_group_ai_record","send_group_ark_share","send_group_forward_msg","send_group_msg","send_group_sign","send_like","send_msg","send_packet","send_poke","send_private_forward_msg","send_private_msg","send_qzone_msg","send_to_new_members","set_diy_online_status","set_essence_msg","set_friend_add_request","set_friend_remark","set_friends_category","set_group_add_option","set_group_admin","set_group_ban","set_group_card","set_group_kick","set_group_leave","set_group_name","set_group_remark","set_group_special_title","set_group_whole_ban","set_input_status","set_msg_emoji_like","set_online_status","set_qq_avatar","set_qq_profile","set_self_longnick","upload_group_file","upload_private_file","upload_forward_msg"]);
 // 启发式映射已知会猜错的：宁可明确报"待精确实现"，也不返回语义错误的数据。
 const COMPAT_DENY = new Set([
+  'get_credentials',         // 实测被映射到 getAutoReplyTextList（自动回复列表）
+  'get_cookies',             // 需要原生 cookie 口，已在 qzone 分支单独实现
+  'get_csrf_token',          // 同上（由 skey 算 g_tk）
+  'get_qzone_feeds',
+  'get_qzone_home_feeds',
+  'get_qzone_msg_list',
+  'get_qzone_profile',
+
   'get_profile_like',         // 实测落到 getUserDetailInfo，返回里没有赞数
   'get_group_share_link',   // 换到的是别的方法，语义不对
   'get_group_notice',       // 暂无精确映射
