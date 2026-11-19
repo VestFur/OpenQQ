@@ -326,10 +326,9 @@ const OIDB_ACTIONS = {
     danger: true,
   },
 
-  // ⚠️ set_group_name 不在这里：`native/admin.cjs` L35 有 `case 'set_group_name'`
+  // ⚠️ set_group_name 不在这里：`native/admin.cjs` 有 `case 'set_group_name'`
   //    （走 groups().modifyGroupName），它比这张表更早执行，实测能真改群名。
-  //    这里再放一份只会造成「以为走 OIDB、实际走内核」的混淆 —— 2026-11-19 已经因为
-  //    这个把群 1041147387 的名字改成了 tob-x，删掉。
+  //    这里再放一份只会造成「以为走 OIDB、实际走内核」的混淆，已经删掉。
 
   // ==================== 第三批（2026-11-19，补完剩余）====================
 

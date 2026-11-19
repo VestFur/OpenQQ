@@ -2136,8 +2136,8 @@ function createActionHandler(session, self, current, options = {}) {
         clientKeyLen: clientKey.length, g_tk: skey ? gtk : null,
       };
 
-      // ⚠️ QQ 的 uin cookie 是 `o0` + 10 位 uin（如 o02975434328），只写 `o` + uin 会让服务端
-      // 返回 code:0 但 msglist 为空数组——2026-11-19 实测踩到，表现为 total 有值、count 恒 0。
+      // ⚠️ QQ 的 uin cookie 是 `o0` + 10 位 uin，只写 `o` + uin 会让服务端返回
+      // code:0 但 msglist 为空数组 —— 实测踩到，表现为 total 有值、count 恒 0。
       const cookieText = 'uin=o0' + uin + '; p_skey=' + encodeURIComponent(skey) + '; skey=' + encodeURIComponent(skey) + '; p_uin=o0' + uin;
 
       if (action.action === 'debug_qzone_credential' || action.action === 'get_cookies' || action.action === 'get_csrf_token') {
