@@ -56,7 +56,8 @@ const NATIVE_ALIAS = {
   get_group_shut_list: 'get_group_shutup_list',
   // SL 的两个历史拼写/旧名，指向已验证的主名实现
   click_inline_keyboard_button: 'click_inline_button',
-  upload_foward_msg: 'upload_forward_msg',
+  // OneBot v11 标准名：专属头衔。主名 set_special_title 走 OIDB 0x8fc_2。
+  set_group_special_title: 'set_special_title',
   // ⚠️ friend_poke / group_poke 不在这里——别名表只认 NATIVE_OPS 里的动作，
   // 而拍一拍走的是 sso_pipe 分支。三个名字在 validateAction 的拍一拍分支里一起判断。
 };
@@ -771,6 +772,13 @@ function validateAction(request) {
   // 语义化原生直通：一个动作一行（service + method + 参数构造）。
   // 参数形状靠 argc 断言和错误文案探出来的，没探清的不进这张表，走 native_call 原样透传。
   const nativeName = NATIVE_ALIAS[request.action] || request.action;
+  // 合并转发上传（SL 的 upload_forward_msg / upload_foward_msg）：只上传资源、不发送，返回 res_id。
+  // QQ NT 的 Msg.multiForwardMsg(argc=3) 第 1/2 参必须是真实 msgInfos + 目标 peerUid，
+  // 空形状一律 `Cannot convert undefined or null to object`，目前没有真消息样本可以定形状。
+  // 与其假装成功，这里如实说明并指向已经可用的发送路径。
+  if (request.action === 'upload_forward_msg' || request.action === 'upload_foward_msg') {
+    throw fail('upload_forward_msg 需要真实消息引用（QQ NT multiForwardMsg 的 msgInfos/peerUid 形状未定）；要发送合并转发请用 send_group_forward_msg / send_private_forward_msg', 1404);
+  }
   // nc_get_user_status 走 handler 分支。
   // ⭐ 正解不是 Profile.getStatus（那个要 uid、传 uin 恒回 316），而是 getUserDetailInfoByUin
   // 返回的 detail.simpleInfo.status —— 实测直接带 status:20 / extStatus / termType 等完整状态，
@@ -830,10 +838,14 @@ function validateAction(request) {
   // 这一整族是「JS 层没有对应方法」的那批（群设置 / 待办 / 管理员权限 / 闪传改名），
   // 只能走 OIDB。表在 native/oidb-actions.cjs，加动作只加一行。
   // 危险动作（danger:true，不可撤回且影响他人）默认**只构造不发送**，必须显式 confirm_danger 才真发。
-  if (oidb.OIDB_ACTIONS[request.action]) {
-    const act = oidb.OIDB_ACTIONS[request.action];
+  // ⚠️ 这里必须认别名：NATIVE_ALIAS 里的名字（set_group_special_title → set_special_title）
+  // 在 OIDB 表里只有主名，直接用 request.action 查表会漏掉它们。
+  const oidbName = oidb.OIDB_ACTIONS[request.action] ? request.action
+    : (oidb.OIDB_ACTIONS[nativeName] ? nativeName : null);
+  if (oidbName) {
+    const act = oidb.OIDB_ACTIONS[oidbName];
     let body;
-    try { body = oidb.buildOidbBody(request.action, params); }
+    try { body = oidb.buildOidbBody(oidbName, params); }
     catch (e) { throw fail(`${request.action} 参数无效: ${e && e.message ? e.message : e}`, 1400); }
     if (act.danger && params.confirm_danger !== true) {
       return {
@@ -880,6 +892,26 @@ function validateAction(request) {
   const target = identifier(type === 'private' ? params.user_id : params.group_id, type === 'private' ? 'user_id' : 'group_id');
   const chatType = type === 'private' ? 1 : 2;
   return { kind: 'send', chatType, target, ...messageParts(params, chatType) };
+}
+
+// QQ 的原生方法把「业务拒绝」放在返回值里而不是抛错：errMsg / msg 里带失败文案。
+// 原样报 ok 会让调用方以为成功 —— get_profile_like 的「获取数据失败」、
+// check_url_safely 的「param error」、delete_custom_face 的「繁忙」都是这么被吞掉的。
+// 只认「有明确失败文案」的情况，不拿数字码判断：errCode 5 这类是「这个群没有精华」的状态，不是失败。
+const NATIVE_FAIL_RE = /(失败|错误|繁忙|超时|无权限|拒绝|不存在|没有权限|not exist|failed|failure|error|\berr\b|invalid|denied|timeout|busy)/i;
+const NATIVE_FAIL_KEYS = ['errMsg', 'errMs', 'msg', 'message', 'wording', 'errorMsg'];
+function nativeRefusal(value, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 2) return null;
+  for (const key of NATIVE_FAIL_KEYS) {
+    const text = value[key];
+    if (typeof text === 'string' && text.trim() && NATIVE_FAIL_RE.test(text)) return text.trim().slice(0, 200);
+  }
+  // 只下钻这几个已知的包裹层（FlashTransfer 把结果放在 rsp 里），不扫整棵对象以免误伤。
+  for (const key of ['rsp', 'value', 'data', 'info']) {
+    const nested = nativeRefusal(value[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
 }
 
 function createActionHandler(session, self, current, options = {}) {
@@ -1424,7 +1456,10 @@ function createActionHandler(session, self, current, options = {}) {
         const effective = (value === undefined || value === null) && cbCalled ? cbValue : value;
         let out = effective;
         try { out = JSON.parse(JSON.stringify(effective === undefined ? null : effective)); } catch { out = String(effective); }
-        return { status: 'ok', retcode: 0, data: { action: action.action, service: action.service, method: action.method, argc: callArgs.length, via: cbCalled && (value === undefined || value === null) ? 'callback' : 'return', value: out } };
+        const nativeData = { action: action.action, service: action.service, method: action.method, argc: callArgs.length, via: cbCalled && (value === undefined || value === null) ? 'callback' : 'return', value: out };
+        const refusal = nativeRefusal(out);
+        if (refusal) return { status: 'failed', retcode: 1500, data: nativeData, message: 'QQ 拒绝' + action.action + '：' + refusal };
+        return { status: 'ok', retcode: 0, data: nativeData };
       } catch (error) {
         return { status: 'failed', retcode: 1500, data: { action: action.action, service: action.service, method: action.method, argc: callArgs.length, cbCalled },
           message: String(error && error.message ? error.message : error).slice(0, 300) };
@@ -1809,7 +1844,11 @@ function createActionHandler(session, self, current, options = {}) {
         if (typeof groupSvc[name] !== 'function') { attempts.push({ name, error: 'method missing' }); continue; }
         try {
           const value = await groupSvc[name](...args);
-          return { status: 'ok', retcode: 0, data: { action: action.action, via: name, value: value === undefined ? null : value } };
+          const v = value === undefined ? null : value;
+          // 这些方法不抛错，业务失败写在 errCode/errMsg 里（319「登录态白名单校验失败」就是这么藏住的）。
+          const ref = nativeRefusal(v);
+          if (ref) return { status: 'failed', retcode: 1500, data: { action: action.action, via: name, value: v }, message: 'QQ 拒绝' + (action.action || action.kind) + '：' + ref };
+          return { status: 'ok', retcode: 0, data: { action: action.action, via: name, value: v } };
         } catch (error) {
           attempts.push({ name, error: String(error && error.message ? error.message : error).slice(0, 120) });
         }
@@ -2540,6 +2579,12 @@ function createActionHandler(session, self, current, options = {}) {
               : undefined;
             if (typeof code === 'number' && code !== 0) {
               attempts.push({ name, argc: args.length, nativeCode: code, errMsg: String(value.errMsg || value.message || '') });
+              continue;
+            }
+            // 启发式分支：业务失败文案同样要认，否则会把「失败」当成命中形状直接报成功。
+            const heuristicRefusal = nativeRefusal(value);
+            if (heuristicRefusal) {
+              attempts.push({ name, argc: args.length, errMsg: heuristicRefusal });
               continue;
             }
             return { status: 'ok', retcode: 0, data: { action: action.action, via: name, args: args.length, value: value === undefined ? null : value } };

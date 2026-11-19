@@ -116,7 +116,8 @@ test('invalid parameters are rejected before anything reaches QQ', async t => {
   ];
   for (const [action, params, pattern] of bad) await assert.rejects(ok(f, action, params), pattern, action + ' ' + JSON.stringify(params));
   assert.deepEqual(f.calls, []);
-  await assert.rejects(f.handler.execute({ action: 'set_group_special_title', params: { group_id: 1, user_id: 2, special_title: 'x' } }), /尚未支持动作/);
+  // set_group_special_title 已实现（OneBot v11 标准名 → OIDB 0x8fc_2 的 set_special_title），
+  // 不再属于「尚未支持动作」，所以这里只保留仍未实现的那一个。
   await assert.rejects(f.handler.execute({ action: 'set_group_anonymous_ban', params: {} }), /尚未支持动作/);
 });
 
