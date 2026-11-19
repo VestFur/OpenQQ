@@ -295,7 +295,13 @@ function startNative(config, wrapper) {
         } catch { try { s.destroy(); } catch { /* 收到坏帧，断开等重连 */ } return; }
         busy++;
         hook.execute(frame.request).then(data => {
-          if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'ok', retcode: 0, data } });
+          // hook 有两种返回形态：上游 handler 给裸数据，我们新增的 handler 直接给 OneBot 回执。
+          // 后者必须原样透传——无条件包一层 { status:'ok', retcode:0 } 会把失败吞掉，
+          // 调用方永远看到 retcode 0（set_group_search 超时、危险动作 dryrun 都会被报成功）。
+          const replay = data && typeof data === 'object'
+            && (data.status === 'ok' || data.status === 'failed')
+            && Number.isSafeInteger(data.retcode);
+          if (!disposed) write({ type: 'action_result', id: frame.id, response: replay ? data : { status: 'ok', retcode: 0, data } });
         }, error => {
           if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'failed', retcode: error.retcode ?? 1500, data: null, message: error.message } });
         }).finally(() => { busy--; });
