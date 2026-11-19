@@ -1,7 +1,39 @@
 'use strict';
 
 const { createEventReceiver } = require('./events.cjs');
-const { createActionHandler } = require('./actions.cjs');
+// ── 热重载（2026-11-19）：actions.cjs 不被打包进 session.cjs，而是运行时 require。
+// 改完 dist/native/actions.cjs 后，下一次动作调用会自动重载，不需要重启 QQ 或 OpenQQ。
+const __path = require('node:path');
+const __fs = require('node:fs');
+const __actionsPath = __path.join(__dirname, 'actions.cjs');
+// ⚠️ 热重载必须连**依赖的兄弟模块**一起清缓存，否则 actions.cjs 重载了、
+// 但它内部 require('./oidb-actions.cjs') 还是旧的那份 —— 表现是"表里明明加了动作，却回 尚未支持动作"。
+const __depNames = ['actions.cjs', 'admin.cjs', 'oidb-actions.cjs', 'pb-mini.cjs', 'sso-pipe.cjs', 'cq.cjs', 'elements.cjs', 'common.cjs'];
+function __loadActions() {
+  for (const name of __depNames) {
+    const p = __path.join(__dirname, name);
+    try { delete require.cache[require.resolve(p)]; } catch (e) { /* 文件不存在就跳过 */ }
+  }
+  return require(__actionsPath);
+}
+function __maybeReloadActions(attachment) {
+  if (!attachment || !attachment.__actionsCtx) { globalThis.__hotDebug = { why: 'no-ctx' }; return; }
+  try {
+    const st = __fs.statSync(__actionsPath);
+    const same = attachment.__actionsStamp === st.mtimeMs;
+    globalThis.__hotDebug = { stamp: attachment.__actionsStamp, mtime: st.mtimeMs, same };
+    if (same) return;
+    const fresh = __loadActions();
+    attachment.actions = fresh.createActionHandler(...attachment.__actionsCtx);
+    attachment.__actionsStamp = st.mtimeMs;
+    globalThis.__hotDebug.reloaded = true;
+    console.error('[hot] reloaded actions.cjs mtime=' + st.mtimeMs);
+  } catch (e) {
+    globalThis.__hotDebug = { why: 'throw', error: String((e && e.message) || e) };
+    console.error('[hot] reload failed: ' + String((e && e.stack) || e));
+  }
+}
+const { createActionHandler } = __loadActions();
 
 // Only the client-created session is observed; login tickets never leave QQ.
 function createSessionHook(report) {
@@ -41,9 +73,11 @@ function createSessionHook(report) {
       attached.set(session, attachment);
       const current = () => active && attached.get(session) === attachment;
       const receive = createEventReceiver(session, self, emit, current);
-      attachment.actions = createActionHandler(session, self, current, {
+      attachment.__actionsCtx = [session, self, current, {
         expandForward: receive.expandForward, fetchMessage: receive.fetchMessage, friendList: receive.friendList, lookupRecent: receive.lookupRecent, resolveMedia: receive.resolveMedia, record: receive.record, groups: receive.groups,
-      });
+      }];
+      attachment.actions = createActionHandler(...attachment.__actionsCtx);
+      try { attachment.__actionsStamp = __fs.statSync(__actionsPath).mtimeMs; } catch { attachment.__actionsStamp = 0; }
       for (const [source, getter, add, remove] of [
         ['msg', 'getMsgService', 'addKernelMsgListener', 'removeKernelMsgListener'],
         ['buddy', 'getBuddyService', 'addKernelBuddyListener', 'removeKernelBuddyListener'],
@@ -179,6 +213,7 @@ function createSessionHook(report) {
   async function execute(request) {
     const sessions = [...attached.values()].filter(value => value.ready);
     if (!active || sessions.length !== 1) throw Object.assign(new Error('需要唯一的已初始化 QQ 会话'), { retcode: 1502 });
+    __maybeReloadActions(sessions[0]);
     return sessions[0].actions.execute(request);
   }
   // 断线重连后重放会话状态：session_ready 只在 QQ 会话初始化时产生一次，
