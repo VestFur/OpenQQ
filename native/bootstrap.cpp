@@ -1,7 +1,47 @@
 #include "bootstrap.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+
+// 复用 SnowLuma 的 SSO 通道：把它的 hook 组件注入到同一个 QQ 进程里。
+//
+// 它自包含（导入表只有 KERNEL32，qq_hook.dll 是它的导出表名而不是依赖），
+// 注入后会在 \\.\pipe\mojo.<pid>.control 建一个命名管道，我们的 JS 侧
+// （native/sso-pipe.cjs）通过它发任意 SSO 包——这是拍一拍、内核没有的群管理、
+// QZone p_skey 等「QQ JS 层全是空壳」的唯一活路。
+//
+// 路径解析顺序：环境变量 OPENQQ_SL_DLL → 本 DLL 同目录的 snowluma-win32-x64.dll。
+// 找不到就静默跳过，不影响 OpenQQ 本身。
+static void loadSsoBridge() {
+    static bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+    std::wstring path;
+    if (const char* raw = std::getenv("OPENQQ_SL_DLL")) {
+        if (*raw) {
+            wchar_t wide[32768];
+            if (MultiByteToWideChar(CP_UTF8, 0, raw, -1, wide, 32768) > 0) path.assign(wide);
+        }
+    }
+    if (path.empty()) {
+        // 注意：GetModuleFileNameW(nullptr, …) 返回的是宿主 exe（QQ.exe）的路径，
+        // 不是本 DLL 的。必须先用 FROM_ADDRESS 拿到自己的模块句柄。
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&loadSsoBridge), &self) && self) {
+            wchar_t selfPath[32768];
+            if (GetModuleFileNameW(self, selfPath, 32768) != 0) {
+                std::wstring dir(selfPath);
+                const auto pos = dir.find_last_of(L"\\/");
+                if (pos != std::wstring::npos) path = dir.substr(0, pos + 1) + L"snowluma-win32-x64.dll";
+            }
+        }
+    }
+    if (path.empty()) return;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    LoadLibraryW(path.c_str());
+}
 
 template<class T> static T api(HMODULE module, const char* name) {
     auto address = GetProcAddress(module, name);
@@ -15,6 +55,7 @@ static void check(int status) {
 extern "C" __declspec(dllexport) void* OpenQQBootstrap(void* env, void* exports, BootstrapConfig* config) {
     // Run QQ's initializer unchanged, including any pending exception it creates.
     void* result = config->original(env, exports);
+    loadSsoBridge();
     void* scope = nullptr;
     bool introducedException = false;
     using Pending = int (*)(void*, bool*);
