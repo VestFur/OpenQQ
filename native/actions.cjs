@@ -137,16 +137,6 @@ const NATIVE_OPS = {
   } },
   // 最近使用表情（实测 () 直接返回 emojiInfoList）
   get_recent_emoji: { service: 'msg', method: 'getRecentUseEmojiList', arity: 0, build: () => [] },
-  // 「正在输入」状态：对应 SL 的 set_input_status / OIDB 3284
-  // 实测参数顺序是 (chatType, eventType, peerUid)，不是「peer 打头」——旧实现里写的就是这个顺序，
-  // 所以这里跟它保持一致，只是把 target 从「只支持 user_id」放开到 group_id 也能用。
-  set_input_status: { service: 'msg', method: 'sendShowInputStatusReq', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    const peer = nativePeerOf(p);
-    const evt = Number(p.event_type ?? p.status ?? 0);
-    if (!Number.isSafeInteger(evt) || evt < 0) throw new Error('event_type 必须是非负整数');
-    return [peer.chatType, evt, peer.peerUid];
-  } },
   // 内联按钮（机器人卡片上的按钮）：对应 OIDB 4398
   click_inline_button: { service: 'msg', method: 'clickInlineKeyboardButton', arity: 1, build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
@@ -700,15 +690,8 @@ function validateAction(request) {
       headers: params.headers && typeof params.headers === 'object' ? params.headers : null,
     };
   }
-  // SL 自己的两个占位：SnowLuma 里 set_group_anonymous / set_group_anonymous_ban 是
-  // `run: async () => okResponse()`，notes 明写"兼容占位接口：当前返回成功但不会修改匿名设置"。
-  // 我们照同一语义实现——返回成功、不做任何修改，并如实标 implemented:false，不假装支持。
-  if (request.action === 'set_group_anonymous' || request.action === 'set_group_anonymous_ban') {
-    return {
-      kind: 'noop', action: request.action, implemented: false,
-      groupId: String(params.group_id ?? params.group ?? ''),
-    };
-  }
+  // set_group_anonymous / set_group_anonymous_ban 保持"尚未支持动作"：
+  // 上游没有这两个动作的实现，用成功回执假装支持会让调用方以为匿名设置真的改了。
   // ── 明确做不了的动作：如实返回 1404 + 原因，不假装支持 ────────────────────
   // 群相册 6 个：SL 走自己的 `ctx.bridge.apis.groupAlbum.*`（SnowLuma 私有 bridge），
   //   内核 Album 服务的 getQunFeeds / getQunFeedDetail / getFeedById / quoteToQzone / deleteQunFeed
@@ -743,7 +726,7 @@ function validateAction(request) {
     const isGroup = request.action === 'forward_group_single_msg';
     const target = String((isGroup ? params.group_id : params.user_id) ?? '').trim();
     if (!target) throw fail(request.action + ' 需要 ' + (isGroup ? 'group_id' : 'user_id'), 1400);
-    return { kind: 'forward', action: request.action, source: ref, targetUin: target, targetChatType: isGroup ? 2 : 1 };
+    return { kind: 'forward_send', action: request.action, source: ref, targetUin: target, targetChatType: isGroup ? 2 : 1 };
   }
   if (request.action === 'download_rich_media') {
     const fileUuid = String(params.file_id ?? params.fileUuid ?? params.uuid ?? '');
@@ -762,9 +745,10 @@ function validateAction(request) {
     if (!Number.isInteger(count) || count <= 0 || count > 500) throw fail('count 必须是 1~500 的整数', 1400);
     return { kind: 'fav_emoji', count };
   }
-  // 「正在输入」现在统一走 NATIVE_OPS 的 set_input_status（那边支持 group_id 与 user_id 两种目标）。
-  // 原来这里有一条只吃 user_id 的分支，它在 NATIVE_OPS 之前短路，导致群聊调用直接报
-  // 「user_id 必须是有效的 QQ 数值标识」——同一个动作两处实现只会互相遮蔽，已删除。
+  if (request.action === 'set_input_status') {
+    if (!Number.isInteger(params.event_type) || params.event_type < 0 || params.event_type > 0x7fffffff) throw fail('event_type 必须是非负 int32');
+    return { kind: 'input', target: identifier(params.user_id, 'user_id'), eventType: params.event_type };
+  }
   if (request.action === 'get_forward_msg') {
     const ref = nativeRef(params.openqq_ref, true);
     if (!ref) throw fail('合并转发 id 无效或已过期（仅支持本次运行期间收到的消息）', 1404);
@@ -1040,15 +1024,6 @@ function createActionHandler(session, self, current, options = {}) {
     if (action.kind === 'hot_probe') {
       return { status: 'ok', retcode: 0, data: { action: 'hot_reload_probe', stamp: action.stamp, at: Date.now(), hotDebug: globalThis.__hotDebug ?? null } };
     }
-    if (action.kind === 'noop') {
-      // 与 SL 的 okResponse() 占位同语义：调用方拿到成功，但没有任何副作用。
-      // implemented:false 让调用方能区分"真的做了"和"只是兼容占位"。
-      return {
-        status: 'ok', retcode: 0,
-        data: { action: action.action, implemented: false, group_id: action.groupId,
-          note: '兼容占位：返回成功但不执行任何修改（与 SnowLuma 同语义）' },
-      };
-    }
     if (action.kind === 'download_file') {
       // 落盘到 <openqq>/data/downloads/ —— 和 SL 的服务端临时目录语义一致（不是 MCP 主机路径）。
       const fsMod = require('node:fs');
@@ -1079,7 +1054,7 @@ function createActionHandler(session, self, current, options = {}) {
       fsMod.writeFileSync(dest, buf);
       return { status: 'ok', retcode: 0, data: { action: 'download_file', file: dest, name: pathMod.basename(dest), size: buf.length } };
     }
-    if (action.kind === 'forward') {
+    if (action.kind === 'forward_send') {
       // 源消息：来自主进程附加的 openqq_ref，里面有真 msgId + 源会话的 peerUid（nativeRef 已校验格式）
       const src = action.source;
       // 目标会话：把 targetUin（QQ 号/群号）换成 peerUid。getUserDetailInfoByUin 是 argc==1 + 异步，必须 await。
@@ -2644,27 +2619,6 @@ function createActionHandler(session, self, current, options = {}) {
         } catch (error) { attempts.push({ label: c.label, ok: false, error: String(error && error.message ? error.message : error).slice(0, 180) }); }
       }
       return { status: 'failed', retcode: 1500, data: { attempts }, message: '富媒体下载没有可用原生方法（见 data.attempts）' };
-    }
-    if (action.kind === 'friend_list') {
-      // QQ NT: getBuddyList() 返回 { result: { data: [...] } } 一类的结构，形状不保证，逐层兜底取。
-      const buddy = session.getBuddyService();
-      const buddyArgs = [[false], [true], [0], [1]];
-      let raw = null;
-      let usedArgs = null;
-      let lastBuddyError = null;
-      for (const args of buddyArgs) {
-        try { raw = await buddy.getBuddyList(...args); usedArgs = args; break; } catch (error) { lastBuddyError = error; }
-      }
-      if (usedArgs === null) throw fail('getBuddyList 参数不匹配：' + (lastBuddyError && lastBuddyError.message), 1500);
-      const pick = value => (value && value.result && value.result.data) || (value && value.data) || value || [];
-      const list = pick(raw);
-      const arr = Array.isArray(list) ? list : (list?.buddies ?? list?.list ?? []);
-      return { status: 'ok', retcode: 0, data: arr.map(item => ({
-        user_id: (item?.uin ?? item?.uid ?? null),
-        nickname: String(item?.nick ?? item?.nickname ?? ''),
-        remark: String(item?.remark ?? item?.cardName ?? ''),
-        raw_shape: item && typeof item === 'object' ? Object.keys(item).slice(0, 12) : null,
-      })) };
     }
     if (action.kind === 'stranger') {
       const detail = await session.getProfileService().getUserDetailInfoByUin(action.uin);
