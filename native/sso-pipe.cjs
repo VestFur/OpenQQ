@@ -1,13 +1,12 @@
 ﻿'use strict';
 /**
- * SSO over pipe —— 复用 SnowLuma 注入组件提供的 SSO 发送通道。
+ * SSO over pipe —— 通过一个外部注入组件转发 SSO 包。
  *
- * 背景（2026-11-19 逆向 + 实机验证，见 .botharness/逆向-SL发包机制.md）：
- *   SnowLuma 的 snowluma-win32-x64.dll 是自包含 hook 组件，注入 QQ 后会在
- *   \\.\pipe\mojo.<pid>.control 建一个命名管道，外部按 40 字节定长帧把
- *   {cmd, body} 递进去，由它在进程内调 QQ 真正的 SSO 发送链。
+ * 这个组件（可选，不随本仓库或发行包分发，见 README 的说明）注入 QQ 后会在
+ * \\.\pipe\mojo.<pid>.control 建一个命名管道，外部按 40 字节定长帧把 {cmd, body}
+ * 递进去，由它在进程内调用 QQ 真正的 SSO 发送链。
  *
- *   这个模块跑在 QQ 进程内（native/*.cjs），所以 process.pid 就是 QQ 的 pid。
+ * 这个模块跑在 QQ 进程内（native/*.cjs），所以 process.pid 就是 QQ 的 pid。
  *
  * 帧格式（little-endian）：
  *   0  u32 magic = 0x31504851 ("QHP1")
@@ -40,10 +39,9 @@ const MAX_BODY = 0x1000000;
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
-// ⚠️ 连接状态必须挂在 globalThis 上跨"热重载"复用。
-// 原因：热重载会 delete require.cache 后重新 require 本模块，模块级的 socket 会变成新的 null，
-// 而**旧 socket 不会被关闭** → dll 的 pipe server 只接受一个连接 → 新连接直接超时。
-// 表现就是「每次 build 之后 SSO 全线 ETIMEDOUT，重启 QQ 才好」。
+// 连接状态必须挂在 globalThis 上跨热重载复用：热重载会 delete require.cache 后重新 require 本模块，
+// 模块级的 socket 会变成新的 null，而旧 socket 不会被关闭 —— 对端只接受一个连接，新连接就会超时，
+// 表现是「每次改完代码 SSO 全线 ETIMEDOUT」。
 const G = globalThis.__oqSsoState || (globalThis.__oqSsoState = {
   socket: null, connecting: null, recvBuf: Buffer.alloc(0), seq: 0,
   pending: new Map(), lastError: '', loggedIn: false, uin: '0',
@@ -58,7 +56,7 @@ let loggedIn = G.loggedIn;
 let uin = G.uin;
 
 /** 把模块级状态同步回 globalThis（热重载后仍能复用同一个 socket） */
-function __syncState() {
+function syncState() {
   G.socket = socket; G.connecting = connecting; G.recvBuf = recvBuf;
   G.seq = seq; G.lastError = lastError; G.loggedIn = loggedIn; G.uin = uin;
 }
@@ -117,19 +115,14 @@ function onFrame(frame) {
       }
       break;
     }
-    case OP_REPLY:
+    case OP_REPLY: // 回包
+    case OP_ERROR: // 错误回执：对端仍然给了 status/message，按同一条路交回调用方判断
       settle(frame.requestId, 'resolve', {
         status: frame.status, message: frame.message, body: frame.body,
       });
-      break;
-    case OP_ERROR:
-      settle(frame.requestId, 'resolve', {
-        status: frame.status, message: frame.message, body: frame.body,
-      });
-      break;
-    case 6: // 收到一个入站包
       break;
     default:
+      // 其余 op（入站包 6 等）这个模块不消费：它们属于对端自己的推送，忽略即可。
       break;
   }
 }
@@ -174,8 +167,8 @@ function destroy() {
     entry.reject(new Error('pipe closed'));
     pending.delete(id);
   }
+  syncState();
 }
-  __syncState();
 
 function ensureSocket() {
   if (socket && !socket.destroyed) return Promise.resolve(socket);
@@ -184,9 +177,9 @@ function ensureSocket() {
     const name = pipeName();
     const s = net.connect(name);
     let settled = false;
-    // ⚠️ 必须给 connect 加超时：管道"存在但 server 不 accept"时（dll 的 pipe server 被挂死），
+    // 必须给 connect 加超时：管道"存在但 server 不 accept"时（dll 的 pipe server 被挂死），
     //    net.connect 既不触发 'connect' 也不触发 'error'，这个 Promise 会永远 pending。
-    //    而 `connecting` 一直非 null → 后续所有 ensureSocket() 都返回这个永挂的 Promise
+    //    而 `connecting` 一直非 null → 后续所有 ensureSocket 都返回这个永挂的 Promise
     //    → 表现为「一批动作集体 ETIMEDOUT，重启 QQ 才恢复」。这就是那个假死的真根因。
     const timer = setTimeout(() => {
       fail(Object.assign(new Error('pipe connect timeout'), { code: 'ETIMEDOUT' }));
@@ -213,7 +206,7 @@ function ensureSocket() {
       s.on('error', (e) => { lastError = String(e && e.message); destroy(); });
       s.on('close', () => { destroy(); });
       resolve(s);
-      __syncState();
+      syncState();
     });
   });
   return connecting;
@@ -268,18 +261,11 @@ async function ping(timeoutMs = 3000) {
   });
 }
 
-// ---- 极简 protobuf 编码（够 OIDB 用）----
-function pbVarint(n) {
-  const out = [];
-  let v = BigInt(n);
-  if (v < 0n) v = BigInt.asUintN(64, v);
-  while (v > 0x7fn) { out.push(Number(v & 0x7fn) | 0x80); v >>= 7n; }
-  out.push(Number(v));
-  return Buffer.from(out);
-}
-const pbTag = (num, wire) => pbVarint((num << 3) | wire);
-const pbVarintField = (num, n) => Buffer.concat([pbTag(num, 0), pbVarint(n)]);
-const pbBytesField = (num, buf) => Buffer.concat([pbTag(num, 2), pbVarint(buf.length), buf]);
+// ---- protobuf 编码：统一从 pb-mini 取，这里只保留旧的函数名给调用方用 ----
+const pb = require('./pb-mini.cjs');
+const pbVarint = (n) => pb.varint(n);
+const pbVarintField = (num, n) => pb.vint(num, n);
+const pbBytesField = (num, buf) => pb.bytes(num, buf);
 
 /**
  * 构造拍一拍的 OIDB 包体（OidbBase 包 OidbPoke）。

@@ -1,12 +1,12 @@
-'use strict';
+﻿'use strict';
 /**
  * OIDB 动作表 —— 把 SnowLuma 的 protobuf 定义搬过来，一个动作一行。
  *
  * 来源：`index.mjs` 里每个服务的 `__size_OidbBase__<Name>(obj, sizes)` 函数，
  * 其中 `const _fN = obj["键名"]` 的 N 就是 protobuf field 号（field = N+1）。
- * 抽取脚本：`.botharness/extract-sl-pb-schema.mjs` → `sl-pb-schema.json`（110 个服务，94 个有 body schema）。
+ * 字段号来自对协议实现的逐字段核对；非法输入由 pb-mini 直接抛错，不会编成 0。
  *
- * ⚠️ **schema 抽出来必须跟实测对照，不能盲信**。已知一处不符：
+ * **schema 抽出来必须跟实测对照，不能盲信**。已知一处不符：
  *   `SendPoke` 抽出来是 `1:uin 2:groupUin 3:friendUin 4:ext`，
  *   但实测发出去的是 **field 5 / 6**（`08…10…2800 3000`），而且实测能通。
  *   所以拍一拍没走这张表，单独写在 sso-pipe.cjs 的 buildOidbPoke 里。
@@ -15,7 +15,7 @@
  * build 返回「按 schema 键名的对象」，通用编码器负责变成 protobuf 字节。
  */
 
-const { pbVarint, pbVarintField, pbBytesField } = require('./sso-pipe.cjs');
+const { varint: pbVarint, vint: pbVarintField, bytes: pbBytesField } = require('./pb-mini.cjs');
 
 // ---- 通用编码器：按 schema 把对象编成 protobuf ----
 // schema 形如 { 1: {name:'groupUin', kind:'varint'}, 2: {name:'settings', kind:'message', fields:{...}} }
@@ -56,7 +56,7 @@ function wrapOidbBase(command, subCommand, bodyBuf, reserved = 0) {
     pbVarintField(3, 0),
     pbBytesField(4, bodyBuf || Buffer.alloc(0)),
   ];
-  // ⚠️ field 7 `reserved` 就是 SL 里的 `uinForm`：为 1 表示 body 里的账号用 uin 而不是 uid。
+  // field 7 `reserved` 就是 SL 里的 `uinForm`：为 1 表示 body 里的账号用 uin 而不是 uid。
   //    SL 的 makeOidbEnvelope 写的是 `reserved: isUid ? 1 : 0`，而标了 `uinForm: true` 的服务都传 1。
   //    之前我们从不带这个字段 —— `send_tuwen_ark` 回 `30000 param error: client_info.platform`
   //    很可能就是缺它（服务端拿不到 uinForm 就走另一套 client_info 校验）。
@@ -83,7 +83,7 @@ const SETTINGS_HISTORY = {
 /**
  * OIDB_ACTIONS：动作名 → { command, subCommand, wire, body, build }
  * body 是内层 schema；build(params) 返回按 schema 键名的对象。
- * danger: true 表示「不可撤回且影响他人」——只允许构造、不真发（见 rules 0mwn4yb1b）。
+ * danger: true 表示「不可撤回且影响他人」——默认只构造、不真发。
  */
 const OIDB_ACTIONS = {
   // ---- 群设置：0x89a_0 ----
@@ -202,8 +202,8 @@ const OIDB_ACTIONS = {
     }),
   },
 
-  // ==================== 第二批（2026-11-19，一次接 10 个）====================
-  // 全部来自 sl-pb-schema.json 的实测字段号；danger 的按 rules 0mwn4yb1b 只构造不真发。
+  // ==================== 第二批（，一次接 10 个）====================
+  // 字段号均已逐字段核对；标了 danger 的默认只构造不真发。
 
   // ---- 群名片 / 头衔：0x8fc_3 / 0x8fc_2（可撤回，改回即可）----
   set_member_card: {
@@ -326,13 +326,13 @@ const OIDB_ACTIONS = {
     danger: true,
   },
 
-  // ⚠️ set_group_name 不在这里：`native/admin.cjs` 有 `case 'set_group_name'`
-  //    （走 groups().modifyGroupName），它比这张表更早执行，实测能真改群名。
+  // set_group_name 不在这里：`native/admin.cjs` 有 `case 'set_group_name'`
+  //    （走 groups.modifyGroupName），它比这张表更早执行，实测能真改群名。
   //    这里再放一份只会造成「以为走 OIDB、实际走内核」的混淆，已经删掉。
 
-  // ==================== 第三批（2026-11-19，补完剩余）====================
+  // ==================== 第三批（，补完剩余）====================
 
-  // ---- ⭐ 群文件列表（读）—— 之前文件类功能是单向的，就缺这个 ----
+  // ---- 群文件列表（读）—— 之前文件类功能是单向的，就缺这个 ----
   get_group_files_page: {
     command: 1752, subCommand: 1, wire: 'OidbSvcTrpcTcp.0x6d8_1',
     body: {
@@ -569,7 +569,7 @@ const OIDB_ACTIONS = {
     }),
   },
 
-  // ==================== 第四批（2026-11-19，补完）====================
+  // ==================== 第四批（，补完）====================
 
   // ---- 群待办：0xf90_1/2/3 —— SL 用 ACTION_TO_SUBCMD = {set:1, complete:2, cancel:3} 区分 ----
   set_group_todo: {
@@ -601,7 +601,7 @@ const OIDB_ACTIONS = {
   },
 
   // ---- 群文件改名 / 移动 / 取下载链接：0x6d6_4 / 0x6d6_5 / 0x6d6_2 ----
-  // ⚠️ 内层字段号是按 SL serialize 的键顺序推的（这三条的 __size_ 函数名带 $N 后缀，抽不到），
+  // 内层字段号是按 SL serialize 的键顺序推的（这三条的 __size_ 函数名带 $N 后缀，抽不到），
   //    第一次实测若回 145 就按报错里的字段名调。
   rename_group_file: {
     command: 1750, subCommand: 4, wire: 'OidbSvcTrpcTcp.0x6d6_4',
@@ -659,10 +659,10 @@ const OIDB_ACTIONS = {
     },
     build: (p) => ({ download: { groupUin: p.group_id, appId: 7, busId: Number(p.bus_id ?? 102), fileId: String(p.file_id ?? '') } }),
   },
-  // ══ 群相册（2026-11-19）：走 trpc 命令，不是 OIDB ══════════════════════════
+  // ══ 群相册：走 trpc 命令，不是 OIDB ══════════════════════════
   // SL 的 GroupAlbumApi 用 ctx.sendRawPacket(CMD, body)；CMD 是 trpc 服务名字符串。
   // 我们的 sso_pipe_send 本来就支持任意 cmd，所以 `raw: true` + `wire` 用 trpc 名即可。
-  // ⚠️ 三个坑：空 body 回 `1006504 发送异常!`；groupId 必须编成 string（varint 会回 `10000 参数错误，群ID不能为空`）；
+  // 三个坑：空 body 回 `1006504 发送异常!`；groupId 必须编成 string（varint 会回 `10000 参数错误，群ID不能为空`）；
   //           seq 必须是 3331。
   get_group_album_list: {
     command: 0, subCommand: 0, raw: true,
@@ -768,7 +768,7 @@ const OIDB_ACTIONS = {
       return { __raw: Buffer.concat([enc.str(1, String(p.group_id ?? '')), enc.vint(2, 0)]) };
     },
   },
-  // ══ Ark 卡片（2026-11-19）：从 SL 的 ContactsApi 抽出的 OIDB 服务 ═══════
+  // ══ Ark 卡片：从 SL 的 ContactsApi 抽出的 OIDB 服务 ═══════
   // GetBuddyRecommendArk: 4790 = 0x12b6_0，serialize {uin, phoneNumber, jumpUrl}
   // GetGroupRecommendArk: 2231 = 0x8b7_5，serialize {reqType:1, groupCode, flag:1}
   // 注意：这两个在 SL 里是 readOnly 的——**只生成 Ark 卡片 JSON 返回，不发送**。
@@ -875,7 +875,7 @@ const OIDB_ACTIONS = {
       };
     },
   },
-  // ══ 设置管理员接收加群验证（2026-11-19，从 SL 的 SetAdminReceiveVerify 抽出）══
+  // ══ 设置管理员接收加群验证（，从 SL 的 SetAdminReceiveVerify 抽出）══
   // command 2308 = 0x904，subCommand 1，SL 里 uinForm: true
   // SetGroupAdminReceiveVerifyRequest { 1: groupCode, 2: operation }
   // GroupAdminReceiveVerifyOperation { 1: adminUins(repeated) 2: authority 3: operate }
@@ -902,7 +902,7 @@ const OIDB_ACTIONS = {
       };
     },
   },
-  // ══ 设置群机器人加群选项（2026-11-19，从 SL 的 ModifyGroupExtInfo 抽出）══
+  // ══ 设置群机器人加群选项（，从 SL 的 ModifyGroupExtInfo 抽出）══
   // command 3840 = 0xf00，subCommand 3，SL 里 uinForm: true
   // OidbModifyGroupExtReq { 1: groupCode, 2: info }
   // OidbGroupExtInfo      { 1: groupCode, 2: ext }
@@ -934,7 +934,7 @@ const OIDB_ACTIONS = {
 // 含义是"body 里的账号字段用 uin 而不是 uid"。
 // 我们之前从没带这个字段，导致 create_group_file_folder 恒回 `param error: folder name`
 // （服务端把 groupUin 当 uid 解析，folderName 的校验就跟着错位）。
-// 这份清单是从 SL 的 `_X.uinForm = true` 批量抽的（.botharness/list-uinform-wires.mjs）。
+// 这份清单是逐个服务核对 uinForm 得到的：为 1 表示 body 里的账号用 uin 而不是 uid。
 const UIN_FORM_WIRES = new Set([
   'OidbSvcTrpcTcp.0x0_100',
   'OidbSvcTrpcTcp.0x11e9_200',

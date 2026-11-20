@@ -1,14 +1,88 @@
 'use strict';
 
-const { fail, identifier, nativeId } = require('./common.cjs');
+const { fail, identifier, integer, nativeId } = require('./common.cjs');
 const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
-// SSO over pipe：复用注入的 SnowLuma 组件（\\.\pipe\mojo.<pid>.control）发任意 SSO 包。
-// 这是拍一拍 / 内核没有的群管理 / QZone 的 p_skey 等「JS 层全空壳」的唯一活路。
+// SSO over pipe：通过一个可选的外部注入组件（\\.\pipe\mojo.<pid>.control）发任意 SSO 包。
+// 没有这个组件时 sso_pipe_* 与走 OIDB 的动作会如实报「通道未就绪」，不影响其余动作。
 const ssoPipe = require('./sso-pipe.cjs');
-// OIDB 动作表（来自 SnowLuma 的 protobuf 定义）：一个动作一行，加动作只加一行。
+// OIDB 动作表：一个动作一行，加动作只加一行。
 const oidb = require('./oidb-actions.cjs');
+
+// download_file 只接受公网 http(s)。允许任意 URL 会让这个动作变成 SSRF 跳板：打到内网、
+// 127.0.0.1、链路本地地址，或者云环境的元数据地址（169.254.169.254）。
+const PRIVATE_V4 = [
+  [/^0\./, '0.0.0.0/8'],
+  [/^10\./, '10.0.0.0/8'],
+  [/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, '100.64.0.0/10'],
+  [/^127\./, '127.0.0.0/8'],
+  [/^169\.254\./, '169.254.0.0/16'],
+  [/^172\.(1[6-9]|2\d|3[01])\./, '172.16.0.0/12'],
+  [/^192\.168\./, '192.168.0.0/16'],
+];
+const PRIVATE_V6 = [/^::$/, /^::1$/, /^f[cd]/, /^fe[89ab]/, /^::ffff:/];
+
+function assertPublicHttpUrl(raw) {
+  let url;
+  try { url = new URL(String(raw)); } catch { throw fail('download_file 的 url 不是合法地址'); }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw fail('download_file 只支持 http/https');
+  if (url.username || url.password) throw fail('download_file 不接受带账号密码的 url');
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) throw fail('download_file 的 url 没有主机名');
+  if (host === 'localhost' || /\.(localhost|local|internal|lan|home\.arpa)$/.test(host)) {
+    throw fail(`download_file 拒绝本机或内网主机名：${host}`);
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    for (const [pattern, range] of PRIVATE_V4) {
+      if (pattern.test(host)) throw fail(`download_file 拒绝内网地址（${range}）：${host}`);
+    }
+  } else if (host.includes(':')) {
+    for (const pattern of PRIVATE_V6) {
+      if (pattern.test(host)) throw fail(`download_file 拒绝内网 IPv6 地址：${host}`);
+    }
+  }
+  return url;
+}
+
+// 文件名只留安全字符：basename 挡不住 '..'，而 '..' 会让落盘路径跳出 data/downloads。
+function safeDownloadName(raw) {
+  const cleaned = String(raw ?? '')
+    .replace(/[\\/]/g, '_')
+    .replace(/[^\w.\- ]+/g, '_')
+    .replace(/^\.+/, '')
+    .trim()
+    .slice(0, 100);
+  return cleaned && cleaned !== '.' && cleaned !== '..' ? cleaned : '';
+}
+
+// 只拦会被 fetch 用来改变连接目标的头，其余（Referer / Authorization 等）原样保留。
+const BLOCKED_DOWNLOAD_HEADERS = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'upgrade', 'te']);
+function sanitizeDownloadHeaders(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || !key.trim()) continue;
+    if (BLOCKED_DOWNLOAD_HEADERS.has(key.trim().toLowerCase())) continue;
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    out[key.trim()] = String(value).slice(0, 2000);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// 边读边算，超过上限立刻停 —— 一次性 arrayBuffer 会把整份响应读进内存。
+async function readBodyCapped(response, maxBytes) {
+  if (!response.body) return Buffer.from(await response.arrayBuffer());
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of response.body) {
+    total += chunk.length;
+    if (total > maxBytes) throw new Error(`响应超过 ${maxBytes} 字节上限`);
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 
 const MiB = 1024 * 1024;
 // 语义化原生直通表：OneBot 动作名 → 内核 service.method + 参数构造。
@@ -58,7 +132,7 @@ const NATIVE_ALIAS = {
   click_inline_keyboard_button: 'click_inline_button',
   // OneBot v11 标准名：专属头衔。主名 set_special_title 走 OIDB 0x8fc_2。
   set_group_special_title: 'set_special_title',
-  // ⚠️ friend_poke / group_poke 不在这里——别名表只认 NATIVE_OPS 里的动作，
+  // friend_poke / group_poke 不在这里——别名表只认 NATIVE_OPS 里的动作，
   // 而拍一拍走的是 sso_pipe 分支。三个名字在 validateAction 的拍一拍分支里一起判断。
 };
 
@@ -86,7 +160,7 @@ const NATIVE_OPS = {
   translate_en2zh: { service: 'RichMedia', method: 'translateEnWordToZn', arity: 1, build: p => [String(p.text ?? p.words ?? '')] },
   list_filesets: { service: 'FlashTransfer', method: 'getFileSetList', arity: 1, build: p => [{ pageCount: Number(p.count ?? 20), pageIndex: Number(p.index ?? 0) }] },
 
-  // ── 2026-11-19 全量实测补齐（OneBot 标准动作 → 内核真实方法；argc 与参数形状均已用 debug_call 在真机确证）──
+  // ── 全量实测补齐（OneBot 标准动作 → 内核真实方法；argc 与参数形状均已用 debug_call 在真机确证）──
   // 判据：每条都在真机上跑出过 result:0 或明确的业务回执（不是猜的）。
   set_qq_profile: { service: 'Profile', method: 'setNickName', arity: 1, build: p => [String(p.nickname ?? p.nick ?? '')] },
   set_self_longnick: { service: 'Profile', method: 'setLongNick', arity: 1, build: p => [String(p.longNick ?? p.long_nick ?? p.sign ?? p.longnick ?? '')] },
@@ -128,7 +202,7 @@ const NATIVE_OPS = {
   // 表情回应（贴表情）：对应 SL 的 set_msg_emoji_like / OIDB 36994
   set_msg_emoji_like: { service: 'msg', method: 'setMsgEmojiLikes', arity: 5, build: p => {
     if (Array.isArray(p.raw_args)) return p.raw_args;
-    // ⚠️ `message_id` 是 OneBot 自增序号，不是 QQ 真 msgId（见 src/onebot.mjs 的 nextId++）。
+    // `message_id` 是 OneBot 自增序号，不是 QQ 真 msgId（见 src/onebot.mjs 的 nextId++）。
     // 真 msgId + peerUid 要从 `openqq_ref` 拿 —— 和 reply 段、get_forward_msg、forward_* 完全同一套机制。
     const ref = nativeRef(p.openqq_ref);
     const msgId = ref ? String(ref.msgId) : String(p.message_id ?? p.msg_id ?? '');
@@ -136,7 +210,7 @@ const NATIVE_OPS = {
     const isSet = p.is_set === undefined ? true : Boolean(p.is_set);
     return [peer, msgId, String(p.emoji_id ?? p.emoji ?? ''), isSet ? 1 : 0, null];
   } },
-  // 最近使用表情（实测 () 直接返回 emojiInfoList）
+  // 最近使用表情（实测  直接返回 emojiInfoList）
   get_recent_emoji: { service: 'msg', method: 'getRecentUseEmojiList', arity: 0, build: () => [] },
   // 内联按钮（机器人卡片上的按钮）：对应 OIDB 4398
   click_inline_button: { service: 'msg', method: 'clickInlineKeyboardButton', arity: 1, build: p => {
@@ -191,8 +265,8 @@ const NATIVE_OPS = {
     return [String(p.group_id ?? '')];
   } },
 
-  // ⚠️ get_pskey 已交给 OIDB（native/oidb-actions.cjs 的 0x102a_0）：
-  //    TipOff.getPskey 实测 domainPskeyMap 恒空（2026-11-19），留着这条只会短路掉能用的那条。
+  // get_pskey 已交给 OIDB（native/oidb-actions.cjs 的 0x102a_0）：
+  //    TipOff.getPskey 实测 domainPskeyMap 恒空，留着这条只会短路掉能用的那条。
   //    原来那条保留在下面注释里备查，别再启用。
   // get_pskey: { service: 'TipOff', method: 'getPskey', arity: 2, cbIndex: 1, build: p => { ... } },
 
@@ -311,7 +385,7 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ groupCode: String(p.group_id ?? ''), fileId: String(p.file_id ?? ''), busId: Number(p.bus_id ?? 102) }, null];
   } },
-  // ⚠️ rename_group_file 同时存在于这里和 oidb-actions.cjs（0x6d6_4）。
+  // rename_group_file 同时存在于这里和 oidb-actions.cjs（0x6d6_4）。
   //    同名动作只会有第一个匹配的生效——这条在 NATIVE_OPS，先于 OIDB 表被检查。
   //    目前保留内核版本（尚未实测是否也超时）；若确认超时，删掉这条让它走 OIDB。
   rename_group_file: { service: 'RichMedia', method: 'renameGroupFile', arity: 5, cbIndex: 4, build: p => {
@@ -346,7 +420,7 @@ const NATIVE_OPS = {
   // 之前把 {} / 字符串填进去，内核等回调等不到，整条 IPC 会挂住（debug_call 实测 aborted），
   // 表现成 retcode 1500 + cbCalled:false。所以这里 cbIndex:0，让执行侧把真函数注入第 0 个参数。
   //
-  // 2026-11-19 复测（debug_call 逐个形状）：
+  // 复测（debug_call 逐个形状）：
   //  · fetchBottomEmojiTableList({} / [] / null) 一律 1500 "Cannot convert undefined or null to object"
   //    → 它那唯一一个参数必须是回调，但内核内部又对某个 null 做对象操作，这条路是**内核侧坏的**；
   //  · getKeyWordRelatedEmoji 既无同步返回也不触发回调（1500 超时）。
@@ -428,7 +502,7 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [Number(p.page ?? 0), Number(p.count ?? 20)];
   } },
-  // ---- 2026-11-19 第五批：补剩余缺口（argc 全部实测）----
+  // ---- 第五批：补剩余缺口（argc 全部实测）----
   // set_group_reaction 不在这里：NATIVE_ALIAS 已把它指到 set_msg_emoji_like，别名优先。
   // setRcvJoinVerifyMsg 的 body 要有 groupCode + uins 列表；只给 groupCode 会回 errCode 1281 "no admin uins"。
   // set_group_admin_receive_verify 已改走 OIDB 0x904_1（见 oidb-actions.cjs），
@@ -452,7 +526,7 @@ const NATIVE_OPS = {
     if (Array.isArray(p.raw_args)) return p.raw_args;
     return [{ filePath: String(p.file ?? p.path ?? ''), fileName: String(p.name ?? '') }, null];
   } },
-  // ---- 2026-11-19 第六批：一次性补上剩余缺动作（同一轮加完，只重启一次）----
+  // ---- 第六批：一次性补上剩余缺动作（同一轮加完，只重启一次）----
   // add_custom_face 主名走 BDH 三步链路（见 handler 的 custom_face_bdh 分支）。
   // 内核 Msg.addFavEmoji 恒回 decode failed（需 QQ 私有解码串），只留成 legacy 名备查。
   add_custom_face_legacy: { service: 'Msg', method: 'addFavEmoji', arity: 1, build: (p) => {
@@ -673,22 +747,20 @@ function validateAction(request) {
       wantReply: true, timeoutMs: 15000,
     };
   }
-  // ── 文件下载（2026-11-19）：不走内核，SL 也是纯 HTTP 落盘 ───────────────
+  // ── 文件下载：不走内核，直接用 HTTP 取回落盘 ───────────────
   // 内核 RichMedia.downloadFile(4) 传空参只回 rc=0 value=null（既无回传对象也不触发回调），
-  // 判断不出成功；SL 的 download_file 根本不用它，是把 url/base64 直接写到 data/downloads。
-  // 热重载探针（2026-11-19）：返回值带构建时间戳，用来验证改完 actions.cjs 不重启就能生效。
-  if (request.action === 'hot_reload_probe') {
-    return { kind: 'hot_probe', stamp: 'BUILD-F' };
-  }
+  // 判断不出成功，所以这里自己取。
   if (request.action === 'download_file') {
     const url = String(params.url ?? '').trim();
     const b64 = String(params.base64 ?? '').trim();
     if (!url && !b64) throw fail('download_file 需要 url 或 base64', 1400);
+    if (url) assertPublicHttpUrl(url);
     return {
       kind: 'download_file', action: 'download_file',
       url, base64: b64,
-      name: String(params.name ?? '').trim(),
-      headers: params.headers && typeof params.headers === 'object' ? params.headers : null,
+      name: safeDownloadName(params.name),
+      headers: sanitizeDownloadHeaders(params.headers),
+      maxBytes: integer(params.max_bytes, 'max_bytes', 1, 64 * 1024 * 1024, 32 * 1024 * 1024),
     };
   }
   // set_group_anonymous / set_group_anonymous_ban 保持"尚未支持动作"：
@@ -714,13 +786,13 @@ function validateAction(request) {
   if (request.action === 'clean_cache') {
     throw fail('clean_cache 不可用：Setting.clearCache 两种参数都超时（不返回也不回调），内核侧没有实现', 1404);
   }
-  // ── 转发单条消息（2026-11-19）：Msg.forwardMsg 的 target 要 peerUid，不要 QQ 号 ──
+  // ── 转发单条消息：Msg.forwardMsg 的 target 要 peerUid，不要 QQ 号 ──
   // uid 用 Profile.getUserDetailInfoByUin(uin) 同步换（110ms、不挂 IPC）。
   // 别再试 UixConvert.getUid —— 那个会把 QQ 挂死（0mwn66ay）。
-  // ── 转发单条消息（2026-11-19 修正）：源消息用 openqq_ref，目标用 uid ──────────
-  // ⚠️ OneBot 的 `message_id` 是主进程自增序号（src/onebot.mjs 的 `nextId++`），**不是 QQ 的 msgId**。
+  // ── 转发单条消息（修正）：源消息用 openqq_ref，目标用 uid ──────────
+  // OneBot 的 `message_id` 是主进程自增序号（src/onebot.mjs 的 `nextId++`），**不是 QQ 的 msgId**。
   // 真 msgId 在主进程的 `refs` Map 里，通过参数的 `openqq_ref` 字段传下来
-  // （和 `get_forward_msg` / reply 段完全同一套机制，见 nativeRef()）。
+  // （和 `get_forward_msg` / reply 段完全同一套机制，见 nativeRef）。
   if (request.action === 'forward_friend_single_msg' || request.action === 'forward_group_single_msg') {
     const ref = nativeRef(params.openqq_ref);
     if (!ref) throw fail(request.action + ' 的 message_id 无效或引用的消息已过期（仅支持本次运行期间收到的消息）', 1404);
@@ -780,7 +852,7 @@ function validateAction(request) {
     throw fail('upload_forward_msg 需要真实消息引用（QQ NT multiForwardMsg 的 msgInfos/peerUid 形状未定）；要发送合并转发请用 send_group_forward_msg / send_private_forward_msg', 1404);
   }
   // nc_get_user_status 走 handler 分支。
-  // ⭐ 正解不是 Profile.getStatus（那个要 uid、传 uin 恒回 316），而是 getUserDetailInfoByUin
+  // 正解不是 Profile.getStatus（那个要 uid、传 uin 恒回 316），而是 getUserDetailInfoByUin
   // 返回的 detail.simpleInfo.status —— 实测直接带 status:20 / extStatus / termType 等完整状态，
   // 一次请求就够，不用再换 uid。
   if (request.action === 'nc_get_user_status') {
@@ -838,7 +910,7 @@ function validateAction(request) {
   // 这一整族是「JS 层没有对应方法」的那批（群设置 / 待办 / 管理员权限 / 闪传改名），
   // 只能走 OIDB。表在 native/oidb-actions.cjs，加动作只加一行。
   // 危险动作（danger:true，不可撤回且影响他人）默认**只构造不发送**，必须显式 confirm_danger 才真发。
-  // ⚠️ 这里必须认别名：NATIVE_ALIAS 里的名字（set_group_special_title → set_special_title）
+  // 这里必须认别名：NATIVE_ALIAS 里的名字（set_group_special_title → set_special_title）
   // 在 OIDB 表里只有主名，直接用 request.action 查表会漏掉它们。
   const oidbName = oidb.OIDB_ACTIONS[request.action] ? request.action
     : (oidb.OIDB_ACTIONS[nativeName] ? nativeName : null);
@@ -972,7 +1044,7 @@ function createActionHandler(session, self, current, options = {}) {
     };
     async function ssoSend(cmd, hex, timeout) {
       const _buffer0 = Buffer.from(hex, 'hex');
-      // 2026-11-19 重写：两个来源都试 + 无条件留痕（上一版非 0/236 时不留痕，等于看不见结果）
+      // 重写：两个来源都试 + 无条件留痕（上一版非 0/236 时不留痕，等于看不见结果）
       try {
         const _probe = { cmd, tried: [] };
         const _svcs = [];
@@ -995,7 +1067,7 @@ function createActionHandler(session, self, current, options = {}) {
         }
         globalThis.__openqqContendProbe2 = _probe;
       } catch (_e3) { globalThis.__openqqContendProbe2 = { cmd, fatal: String(_e3 && _e3.message || _e3).slice(0, 200) }; }
-      // 2026-11-19: msg.sendSsoCmdReqByContend(cmdName, bodyStr) 是同步 SSO 通道(argc==2)，
+      // : msg.sendSsoCmdReqByContend(cmdName, bodyStr) 是同步 SSO 通道(argc==2)，
       // 0=成功 236=没配路由。之前这里只试 msf.sendMsfRequest（包装层坏的），这条从没被走过。
       try {
         const _msgSvc = typeof session.getMsgService === 'function' ? session.getMsgService() : null;
@@ -1053,31 +1125,36 @@ function createActionHandler(session, self, current, options = {}) {
         data: { action: action.action, cmd: action.cmd, bodyHex: action.bodyHex, bodyLen: action.bodyLen, sent: false },
         message: action.note };
     }
-    if (action.kind === 'hot_probe') {
-      return { status: 'ok', retcode: 0, data: { action: 'hot_reload_probe', stamp: action.stamp, at: Date.now(), hotDebug: globalThis.__hotDebug ?? null } };
-    }
     if (action.kind === 'download_file') {
-      // 落盘到 <openqq>/data/downloads/ —— 和 SL 的服务端临时目录语义一致（不是 MCP 主机路径）。
+      // 落盘到 <openqq>/data/downloads/：这个目录只存下载结果，不会被当成代码或配置加载。
       const fsMod = require('node:fs');
       const pathMod = require('node:path');
       const dir = pathMod.join(__dirname, '..', 'data', 'downloads');
       fsMod.mkdirSync(dir, { recursive: true });
-      const rawName = action.name || ('download-' + Date.now());
-      const dest = pathMod.join(dir, pathMod.basename(rawName));
+      const dest = pathMod.join(dir, action.name || ('download-' + Date.now() + '.bin'));
       let buf;
       if (action.base64) {
         buf = Buffer.from(String(action.base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
+        if (buf.length > action.maxBytes) {
+          return { status: 'failed', retcode: 1400, data: { action: 'download_file', size: buf.length },
+            message: `base64 内容超过 ${action.maxBytes} 字节上限` };
+        }
       } else {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), 60000);
         if (timer.unref) timer.unref();
         try {
-          const res = await fetch(action.url, { headers: action.headers || {}, signal: ac.signal });
+          // redirect: 'manual' —— 跟随重定向会让一个公网地址 302 到内网，绕过 validateAction 里的主机检查。
+          const res = await fetch(action.url, { headers: action.headers || {}, signal: ac.signal, redirect: 'manual' });
+          if (res.status >= 300 && res.status < 400) {
+            return { status: 'failed', retcode: 1400, data: { action: 'download_file', url: action.url, http: res.status },
+              message: '下载失败：目标返回重定向，download_file 不跟随（避免被导向内网）' };
+          }
           if (!res.ok) {
             return { status: 'failed', retcode: 1500, data: { action: 'download_file', url: action.url, http: res.status },
               message: '下载失败：HTTP ' + res.status };
           }
-          buf = Buffer.from(await res.arrayBuffer());
+          buf = await readBodyCapped(res, action.maxBytes);
         } catch (error) {
           return { status: 'failed', retcode: 1500, data: { action: 'download_file', url: action.url },
             message: '下载失败：' + String(error && error.message ? error.message : error).slice(0, 160) };
@@ -1136,7 +1213,7 @@ function createActionHandler(session, self, current, options = {}) {
       };
     }
     if (action.kind === 'nc_user_status') {
-      // ⭐ 正解：getUserDetailInfoByUin 的 detail.simpleInfo.status 直接带完整在线状态
+      // 正解：getUserDetailInfoByUin 的 detail.simpleInfo.status 直接带完整在线状态
       // （status/extStatus/batteryStatus/termType/netType/iconType/setTime…），一次请求就够。
       // 不要再去调 Profile.getStatus —— 那个要 uid，而 uid 的四种形状全试过都是 316/116。
       if (!action.uin) return { status: 'failed', retcode: 1400, data: { note: '需要 user_id' } };
@@ -1163,7 +1240,7 @@ function createActionHandler(session, self, current, options = {}) {
       };
     }
     if (action.kind === 'qun_album_upload') {
-      // ══ 群相册上传（照 SL 的 uploadImageToGroupAlbum 复刻，2026-11-19 实测通）══
+      // ══ 群相册上传（照 SL 的 uploadImageToGroupAlbum 复刻，实测通）══
       // 关键三条（都是踩过的坑）：
       //   ① skey 和 p_skey 都从 ssl.ptlogin2.qq.com/jump 累积 Set-Cookie 拿（同名不同域，只留非空、绝不 delete）
       //   ② bkn 必须用 **skey** 算，不是 p_skey（用 pskey 算会回 ret:-100 登录失败）
@@ -1192,7 +1269,19 @@ function createActionHandler(session, self, current, options = {}) {
         + `&u1=${encodeURIComponent('https://qzone.qq.com/' + uin + '/infocenter')}&keyindex=${keyIndex}`;
       const hops = [];
       for (let hop = 0; hop < 8; hop++) {
-        const res = await fetch(cur, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' } });
+        // 每一跳都要有超时：这条链是 QQ 进程内的动作，网络卡住而没有 AbortController
+        // 会让整个动作一直挂在 QQ 进程里，直到 IPC 超时都释放不掉。
+        const hopAbort = new AbortController();
+        const hopTimer = setTimeout(() => hopAbort.abort(), 8000);
+        if (hopTimer.unref) hopTimer.unref();
+        let res;
+        try {
+          res = await fetch(cur, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' }, signal: hopAbort.signal });
+        } catch (error) {
+          return { status: 'failed', retcode: 1500,
+            data: { step: 'jump', hop, hops, url: cur.slice(0, 120) },
+            message: `第 ${hop} 跳超时或失败：` + String(error && error.message ? error.message : error).slice(0, 120) };
+        } finally { clearTimeout(hopTimer); }
         hops.push({ hop, status: res.status, setCookie: (res.headers.getSetCookie ? res.headers.getSetCookie() : []).length, loc: String(res.headers.get('location') || '').slice(0, 60) });
         const sc = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
         for (const c of sc) {
@@ -1307,7 +1396,7 @@ function createActionHandler(session, self, current, options = {}) {
       ]);
       const tailInner = Buffer.concat([pb.vint(1, 0), pb.vint(2, 0), pb.str(3, '0')]);
       const tail = Buffer.concat([pb.bytes(1, tailInner), pb.vint(2, 1)]);
-      // ⚠️ Req 的 tail 是 field 1001（tag 0xCA 0x3E 两字节），不是 field 5 —— 从 SL 的
+      // Req 的 tail 是 field 1001（tag 0xCA 0x3E 两字节），不是 field 5 —— 从 SL 的
       // __write_BDHExpressionRoamReq 里 `buf[offset++] = 202; buf[offset++] = 62;` 读出来的。
       const bdhReq = Buffer.concat([pb.vint(1, 3), pb.vint(2, 1), pb.bytes(3, inner2), pb.vint(4, 9), pb.bytes(1001, tail)]);
       const bdhRes = await ssoPipe.sendSso('ImgStore.BDHExpressionRoam', bdhReq, { wantReply: true, timeoutMs: 12000 });
@@ -1324,7 +1413,7 @@ function createActionHandler(session, self, current, options = {}) {
         }
       }
 
-      // ① HttpConn.0x6ff_501 —— 请求和响应**都是 field 1281**（2026-11-19 实测通，1338 字节）。
+      // ① HttpConn.0x6ff_501 —— 请求和响应**都是 field 1281**（实测通，1338 字节）。
       //    之前记成"请求是 field 1"是错的：`8a 50` 解 varint = 10250 = (1281<<3)|2。
       const httpConnReq = Buffer.from('8a501f0800100018102001300338013805380a38154802500958086205312e302e31', 'hex');
       const hc = await ssoPipe.sendSso('HttpConn.0x6ff_501', httpConnReq, { wantReply: true, timeoutMs: 12000 });
@@ -1405,7 +1494,7 @@ function createActionHandler(session, self, current, options = {}) {
       // 判据：回 status 0 + 有 body = 服务器真的回了；status 非 0 时 message 是服务端原文。
       if (action.action === 'sso_pipe_status') {
         // ping 内部会按需建连接，所以这一个调用同时完成「探活 + 建连」。
-        // 之前只看 status().connected 会永远返回 false（那是纯读状态，不主动连）。
+        // 之前只看 status.connected 会永远返回 false（那是纯读状态，不主动连）。
         const ping = await ssoPipe.ping(3000);
         const st = ssoPipe.status();
         return { status: ping.ok ? 'ok' : 'failed', retcode: ping.ok ? 0 : 1500, data: { ...st, ping } };
@@ -1523,8 +1612,8 @@ function createActionHandler(session, self, current, options = {}) {
       }
 
       // ---- ECDH 服务实例 ----
-      // 实测：new NodeIKernelECDHService() 是空壳（cpp_impl 断言失败），
-      // 真实现只能从 engine.getECDHService() 取。engine 自己也没有 sendOidbRequest。
+      // 实测：new NodeIKernelECDHService 是空壳（cpp_impl 断言失败），
+      // 真实现只能从 engine.getECDHService 取。engine 自己也没有 sendOidbRequest。
       const ecdh = [];
       for (const h of engines) {
         const getter = h.inst && h.inst.getECDHService;
@@ -1563,7 +1652,7 @@ function createActionHandler(session, self, current, options = {}) {
                 let ret;
                 try { ret = fn.apply(holder.inst, build(cb)); }
                 catch (error) { clearTimeout(timer); finish({ via: 'throw', error: String(error && error.message || error).slice(0, 200) }); return; }
-                // 实测结论（2026-11-19）：sendOIDBRequest 同步返回的空对象 {} 就是"已提交"，
+                // 实测结论：sendOIDBRequest 同步返回的空对象 {} 就是"已提交"，
                 // 它**不会**再触发第二个回调 —— 之前改成"等回调"导致每次都卡满超时、回 1501。
                 // 服务端回包走 engine.onSendSSOReply（见下面的钩子），不在这里等。
                 if (ret !== undefined) {
@@ -1586,14 +1675,14 @@ function createActionHandler(session, self, current, options = {}) {
         return { hit: null, attempts };
       };
 
-      // ECDH 会话初始化：断言文案实测 init() 是 0 参。
+      // ECDH 会话初始化：断言文案实测 init 是 0 参。
       // 只做一次，失败不影响后续（失败原因记在 attempts 里）。
       let initInfo = globalThis.__openqqEcdhInitInfo || null;
       if (!initInfo && ecdh.length) {
         const holder = ecdh[0];
         const rec = { at: Date.now(), steps: [] };
         const stringify = v => { try { return JSON.parse(JSON.stringify(v)); } catch { return String(v).slice(0, 200); } };
-        // guid：优先用调用方给的，其次从 engine.getDeviceInfo() 取
+        // guid：优先用调用方给的，其次从 engine.getDeviceInfo 取
         let guid = String(action.guid ?? '');
         if (!guid) {
           try {
@@ -1943,7 +2032,7 @@ function createActionHandler(session, self, current, options = {}) {
         grayCount: grays.length, grays: grays.slice(0, 5) } };
     }
     if (action.kind === 'native_events') {
-      // events.cjs 的 receive() 会记录每一个原始原生回调名（700 多个里只有一部分有名字）。
+      // events.cjs 的 receive 会记录每一个原始原生回调名（700 多个里只有一部分有名字）。
       // 那些 argc==1 且"唯一参数就是回调"的方法，结果常常是走 listener 回来的 —— 靠这张表来定位。
       const ring = globalThis.__openqqNativeEvents || [];
       const pattern = action.pattern ? new RegExp(String(action.pattern), 'i') : null;
@@ -1980,7 +2069,7 @@ function createActionHandler(session, self, current, options = {}) {
         }
         return undefined;
       };
-      // 群聊的 peerUid 必须是**字符串**群号：直接传 identifier() 出来的 number，
+      // 群聊的 peerUid 必须是**字符串**群号：直接传 identifier 出来的 number，
       // 原生会回 result -2（参数类型不对），这和「第三参数类型错」是同一个 -2 但成因不同。
       const peerUid = action.group === null ? await uidOf(action.user, ['convert', 'profile']) : String(action.group);
       const targetUid = action.group === null
@@ -1992,12 +2081,12 @@ function createActionHandler(session, self, current, options = {}) {
       const itemsRich = itemsUid.map(x => ({ ...x, ...(selfUin ? { uin: selfUin } : {}) }));
       const peer = { chatType, peerUid, guildId: '' };
       const grayOf = jsonStr => [{ elementType: 8, elementId: '', grayTipElement: { jsonGrayTipElement: { busiId: '1061', jsonStr } } }];
-      // 2026-11-18 实测定论（四条都验过）：
+      // 实测定论（四条都验过）：
       // ① addLocalJsonGrayTipMsg* 只是本地渲染，QQ 不转发，对方永远看不到；
       // ② 真身是 msg.sendNudge —— 全服务只有它带 Nudge 语义（send_poke 的另一半 recallNudge 是撤回）；
       // ③ 原生断言 argc==3，第三参数必须是 number：传 1 通过类型校验，传 0/2/true/false/uid/uin/'' 全部回 result -2；
       // ④ 即便语法正确，QQ 服务端仍回 result -100（业务侧拒绝，需 aio 上下文或账号权限）。
-      // 2026-11-19 追加：既然 nudge 接口这条路被服务端拦住，就绕开它 —— 拍一拍在协议上就是一条「只有灰条元素」的消息，
+      // 追加：既然 nudge 接口这条路被服务端拦住，就绕开它 —— 拍一拍在协议上就是一条「只有灰条元素」的消息，
       // 用 sendMsg 把 busiId=1061 的灰条当消息体发出去（拿带 tag 的 peer 换回执），早期 NapCat 也是这么发的。
       async function sendGray(jsonStr) {
         const time = session.getMSFService().getServerTime();
@@ -2023,7 +2112,7 @@ function createActionHandler(session, self, current, options = {}) {
         return out;
       };
       const vint = n => Buffer.from(vintBytes(n)).toString('hex');
-      // 2026-11-19 还没试过的分支：sendNudge 回 -100 有可能是「这个会话不在内核的 AIO 列表里」。
+      // 还没试过的分支：sendNudge 回 -100 有可能是「这个会话不在内核的 AIO 列表里」。
       // 先用 setMsgRead 把会话在内核里激活一次（这个方法本身已在 mark_msg_as_read 上实测可用），
       // 再往下试形状。预热失败不影响后面的判断，只是少一条线索。
       let preheat = null;
@@ -2043,7 +2132,7 @@ function createActionHandler(session, self, current, options = {}) {
           if (!hit) throw new Error('SSO 无回调: ' + ssoAttempts.map(a => a.label + '=' + (a.error || 'no-cb')).join(' | '));
           return { cmd: 'OidbSvcTrpcTcp.0xed3_1', hex, via: hit.label, cbArgs: hit.cbArgs };
         }],
-        // 第五条（2026-11-19 新发现）：MsgService 有一个**同步返回**的 SSO 通道 sendSsoCmdReqByContend(argc==2)。
+        // 第五条（新发现）：MsgService 有一个**同步返回**的 SSO 通道 sendSsoCmdReqByContend(argc==2)。
         // 它不挂 IPC（8~80ms 返回），body 的编码方式已实测出来：**原始二进制字符串**
         // （String.fromCharCode(...bytes)；hex/base64/JSON 全部回 result 145「请求包解析失败」）。
         // OidbPoke 结构从 SnowLuma 打包产物里抄到：{uin=1, groupUin=2, friendUin=3, ext=4}。
@@ -2083,7 +2172,7 @@ function createActionHandler(session, self, current, options = {}) {
     }
     if (action.kind === 'qzone') {
       // 空间走 Web API（要 p_skey + g_tk），原生这一层只负责把凭据取出来。
-      // 2026-11-19 定位：拿 p_skey 的正口是 TipOff.getPskey(domains[], cb) ——
+      // 定位：拿 p_skey 的正口是 TipOff.getPskey(domains[], cb) ——
       // 第 1 参**必须是 domain 数组**（传字符串一律回 1003 domain no permission），
       // 结果从第 2 参回调下发（同步返回值里的 domainPskeyMap 是空的）。
       const attempts = [];
@@ -2103,7 +2192,7 @@ function createActionHandler(session, self, current, options = {}) {
       };
 
       // ── 凭据来源：Ticket.forceFetchClientKey 同步给，TipOff.getPskey 实测恒空 ──
-      // 实测（2026-11-19）：
+      // 实测：
       //  · forceFetchClientKey(1) **同步返回** 96 字节 clientKey，0 秒；但它每次都不一样，不是登录态，
       //    拿去当 skey 发 QZone 请求会让服务端直接不响应（20 秒卡死）。
       //  · TipOff.getPskey(domains[], cb) 回 result:0 success，可 domainPskeyMap 永远是 {}。
@@ -2115,7 +2204,7 @@ function createActionHandler(session, self, current, options = {}) {
       const ttl = cred && cred.pskey ? 600000 : 15000;
       if (!cred || now - cred.at > ttl) {
         let pskeyMap = {};
-        // ⭐ 2026-11-19：**OIDB 0x102a_0 是唯一能真拿到 p_skey 的路**（TipOff.getPskey 恒空）。
+        // ：**OIDB 0x102a_0 是唯一能真拿到 p_skey 的路**（TipOff.getPskey 恒空）。
         // 走 SSO over pipe 发 OidbGetPskeyReq{domainList:["qzone.qq.com"]}，回包里 pskey 紧跟在域名后面：
         //   ... 0a 0c "qzone.qq.com" 12 <len> <pskey> ...
         try {
@@ -2152,7 +2241,7 @@ function createActionHandler(session, self, current, options = {}) {
         const ticket = serviceOf('Ticket');
         if (ticket && typeof ticket.forceFetchClientKey === 'function') {
           try {
-            // 实测（2026-11-19）：它**返回对象** {result, errMsg, url, keyIndex, clientKey}，
+            // 实测：它**返回对象** {result, errMsg, url, keyIndex, clientKey}，
             // 不是字符串。之前写成 `typeof direct === 'string'` 判断，把 96 字节的 clientKey 直接丢掉，
             // 表现为 hasClientKey:false —— 而且因为不抛错，attempts 里连一条记录都没有，极难归因。
             const direct = await ticket.forceFetchClientKey(1);
@@ -2175,7 +2264,7 @@ function createActionHandler(session, self, current, options = {}) {
         clientKeyLen: clientKey.length, g_tk: skey ? gtk : null,
       };
 
-      // ⚠️ QQ 的 uin cookie 是 `o0` + 10 位 uin，只写 `o` + uin 会让服务端返回
+      // QQ 的 uin cookie 是 `o0` + 10 位 uin，只写 `o` + uin 会让服务端返回
       // code:0 但 msglist 为空数组 —— 实测踩到，表现为 total 有值、count 恒 0。
       const cookieText = 'uin=o0' + uin + '; p_skey=' + encodeURIComponent(skey) + '; skey=' + encodeURIComponent(skey) + '; p_uin=o0' + uin;
 
@@ -2193,7 +2282,7 @@ function createActionHandler(session, self, current, options = {}) {
             '已确认网络通畅（无 cookie 时 28ms 返回 code -3000），所以缺的是凭据不是网络。' };
       }
 
-      // ⚠️ GET 请求不要带 Origin：实测（2026-11-19）带 `Origin: https://user.qzone.qq.com` 时
+      // GET 请求不要带 Origin：实测带 `Origin: https://user.qzone.qq.com` 时
       // 服务端回 code:0 + total 有值、但 msglist 恒为空数组；去掉 Origin 立刻拿到 5 条。
       // POST 写入类才需要 Origin，由调用方在 init.headers 里单独给。
       const headers = {
@@ -2208,7 +2297,7 @@ function createActionHandler(session, self, current, options = {}) {
           const res = await fetch(url, { ...(init || {}), headers: { ...headers, ...((init && init.headers) || {}) }, signal: ac.signal });
           const text = await res.text();
           // QZone 的 CGI 不管 format=json 还是 jsonp，都可能回 `_preloadCallback({...});` 这种包装，
-          // 直接 JSON.parse 会失败、body 变成 {raw}，表现为 count:0（2026-11-19 实测踩到）。
+          // 直接 JSON.parse 会失败、body 变成 {raw}，表现为 count:0（实测踩到）。
           let body;
           try { body = JSON.parse(text); }
           catch {
@@ -2219,7 +2308,7 @@ function createActionHandler(session, self, current, options = {}) {
           return { http: res.status, body };
         } finally { clearTimeout(timer); }
       };
-      // ⚠️ num 必须 >= 10：实测（2026-11-19）num=5/3 时服务端回 code:0 + total 有值、msglist 空数组；
+      // num 必须 >= 10：实测num=5/3 时服务端回 code:0 + total 有值、msglist 空数组；
       // num>=10 立刻返回真实数据。所以下限拉到 10，调用方传更小也按 10 发。
       const num = Math.min(50, Math.max(10, Number(p.count ?? 20)));
       const pos = Math.max(0, Number(p.pos ?? 0));
@@ -2233,7 +2322,7 @@ function createActionHandler(session, self, current, options = {}) {
         const body = got.body || {};
         const list = Array.isArray(body.msglist) ? body.msglist : (Array.isArray(body.data) ? body.data : []);
         const ok = got.http === 200 && Number(body.code ?? 0) === 0 && !body.message;
-        // 2026-11-19：原来只返回 total/count，调用方看不到任何一条内容，等于"读了个寂寞"。
+        // ：原来只返回 total/count，调用方看不到任何一条内容，等于"读了个寂寞"。
         // 现在把列表也返回（精简字段，避免整个 body 太大）。
         const feeds = list.map((m) => ({
           tid: m.tid != null ? String(m.tid) : null,
@@ -2260,7 +2349,7 @@ function createActionHandler(session, self, current, options = {}) {
         return { status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500, data: { http: got.http, url, body: got.body } };
       }
 
-      // ── 写入类（2026-11-19 按 SnowLuma 的 qzone.ts 逐参数重写）──────────────
+      // ── 写入类（按 SnowLuma 的 qzone.ts 逐参数重写）──────────────
       // SL 的三个 CGI 都用 `h5.qzone.qq.com/proxy/domain/...`，参数一个不能少：
       // 发说说少 `hostuin` 服务端就当没这个空间；删说说 format 必须是 `fs` 不是 `json`。
       // 我们这边 GET 已实测 `user.qzone.qq.com` 不被限流，所以写操作也用 user 前缀，
@@ -2316,7 +2405,7 @@ function createActionHandler(session, self, current, options = {}) {
           data: { http: got.http, tid, code, subcode: sub, ...(ok ? {} : { body: got.body }) } };
       }
       if (action.action === 'set_qzone_msg_right') {
-        // ⚠️ 2026-11-19 实测：`emotion_cgi_update` 不是"改权限"接口，它是**编辑说说正文**的，
+        // 实测：`emotion_cgi_update` 不是"改权限"接口，它是**编辑说说正文**的，
         // 不带 `con` 会回 `code -10005「您未输入内容，随便写点什么吧」`（subcode -4004）。
         // 而且 SL 里根本没有 setQzoneMsgRight 这个函数 —— 这个动作是"名字"而非真实能力。
         // 如实返回未实现，不要假装改成功了。
@@ -2361,7 +2450,7 @@ function createActionHandler(session, self, current, options = {}) {
         return { status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500, data: { http: got.http, tid, body: got.body } };
       }
 
-      // ── 公共号族的旧占位实现已删除（2026-11-19）─────────────────────────
+      // ── 公共号族的旧占位实现已删除─────────────────────────
       // 原来这里有一张 rpcMap，service 名是猜的（qzone_public.Feed 之类），
       // 位置又在真实实现之前，会先把这 13 个动作截走 → 永远走真的那条。
       // 真实三元组见下面的 GOTRPC_OPS（从 SnowLuma 的 qzone.ts 抄的）。
@@ -2884,8 +2973,16 @@ function createActionHandler(session, self, current, options = {}) {
 }
 
 
-// ==== COMPAT_ACTIONS (2026-11-18) ====
-// SnowLuma 的动作表 → OpenQQ 原生服务的启发式映射。先保证"动作存在、有结构化回执"，再按真实调用精修。
+// ==== COMPAT_ACTIONS ====
+// 一批动作名 → 内核服务的启发式映射：按名字给内核方法打分，挑最像的那个调。
+//
+// 为什么保留它、而不是一律回「未实现」：
+//   · 这些动作覆盖的是「读了就行」的查询（好友列表、群信息、历史消息、文件列表…），
+//     内核里确实有对应方法，只是名字与 OneBot 的不一一对应。全部标未实现等于把这些能力白扔掉。
+//   · 它不会假装成功：COMPAT_DENY 里的名字（实测会落到无关方法）和 nativeRefusal 认出的
+//     失败文案都会变成明确的失败回执，不会返回「碰巧没报错」的假数据。
+// 代价是「可能猜错服务」。所以凡是确认了正确方法的动作，都应当从这张表里移出去，
+// 换成 NATIVE_OPS / OIDB_ACTIONS 里的显式条目；这张表是过渡态，不是终点。
 const COMPAT_ACTIONS = new Set(["can_at_all","can_send_image","can_send_record","delete_custom_face","delete_essence_msg","delete_flash_file","delete_friend","delete_group_file","delete_group_file_folder","delete_group_folder","delete_group_tag","delete_msg","delete_qzone_msg","fetch_custom_face","fetch_custom_face_detail","fetch_emoji_like","fetch_face_entity","fetch_ptt_text","fetch_super_face_id","fetch_sys_faces","get_ai_characters","get_ai_record","get_clientkey","get_collection_list","get_cookies","get_credentials","get_csrf_token","get_doubt_friends_add_request","get_emoji_likes","get_essence_msg_list","get_file","get_fileset_id","get_fileset_info","get_flash_file_list","get_flash_file_url","get_forward_msg","get_friend_list","get_friend_msg_history","get_friends_with_category","get_group_admin_permissions","get_group_admin_settings","get_group_album_list","get_group_album_media_list","get_group_at_all_remain","get_group_detail_info","get_group_file_system_info","get_group_file_url","get_group_files_by_folder","get_group_honor_info","get_group_ignore_add_request","get_group_ignored_notifies","get_group_info","get_group_info_ex","get_group_list","get_group_member_info","get_group_member_list","get_group_msg_history","get_group_root_files","get_group_share_link","get_group_shut_list","get_group_signed_list","get_group_system_msg","get_group_tags","get_group_todo_list","get_image","get_login_info","get_mini_app_ark","get_msg","get_msg_emoji_likes","get_online_clients","get_private_file_url","get_profile_like","get_ptt_text","get_qun_album_list","get_qzone_feed_detail","get_qzone_feeds","get_qzone_home_feeds","get_qzone_msg_detail","get_qzone_msg_list","get_qzone_profile","get_recent_contact","get_record","get_record_text","get_rkey","get_rkey_server","get_share_link","get_status","get_stranger_info","get_unidirectional_friend_list","get_version_info","mark_group_msg_as_read","mark_msg_as_read","mark_private_msg_as_read","send_ark_share","send_custom_face","send_flash_msg","send_forward_msg","send_group_ai_record","send_group_ark_share","send_group_forward_msg","send_group_msg","send_group_sign","send_like","send_msg","send_packet","send_poke","send_private_forward_msg","send_private_msg","send_qzone_msg","send_to_new_members","set_diy_online_status","set_essence_msg","set_friend_add_request","set_friend_remark","set_friends_category","set_group_add_option","set_group_admin","set_group_ban","set_group_card","set_group_kick","set_group_leave","set_group_name","set_group_remark","set_group_special_title","set_group_whole_ban","set_input_status","set_msg_emoji_like","set_online_status","set_qq_avatar","set_qq_profile","set_self_longnick","upload_group_file","upload_private_file","upload_forward_msg"]);
 // 启发式映射已知会猜错的：宁可明确报"待精确实现"，也不返回语义错误的数据。
 const COMPAT_DENY = new Set([
@@ -2905,7 +3002,7 @@ const COMPAT_DENY = new Set([
   'fetch_sys_faces',        // 会匹到 fetchMarketEmoticonFaceImages（返回 None）
   'get_recent_contact',     // 已由 NATIVE_OPS 精确实现（RecentContact.getRecentContactList）
   'get_online_clients',     // 已由 NATIVE_OPS 精确实现（OnlineStatus.getOnlineFrdStatusInfos）
-  // 下面这批是 2026-11-19 全量实测抓出来的「调通了但返回的是别的接口的数据」——静默错数据比 1404 更坏，一律拉黑。
+  // 下面这批是 全量实测抓出来的「调通了但返回的是别的接口的数据」——静默错数据比 1404 更坏，一律拉黑。
   'can_at_all',             // 落到 OnlineStatus 图标路径（返回值是 C:\...\OnlineStatus\...）
   'get_record',             // 同上，返回的是文件路径不是语音
   'get_record_text',        // 同上（真身应是 msg.translatePtt2Text，需 3 参）
@@ -2915,7 +3012,7 @@ const COMPAT_DENY = new Set([
   'get_ptt_text',           // 同上（真身应是 msg.translatePtt2Text，需 3 参，要真实语音消息才验得了）
   'get_fileset_info',       // 落到群匿名信息（返回 isAnonymousChat/anonyId）
   'get_group_files_by_folder', // 落到 getGroupTagRecords（返回 tags 不是文件）
-  // 2026-11-19 第二批实测：这批全部落到 getGroupList / getBuddyList / getLastMessageList 等无关方法，
+  // 第二批实测：这批全部落到 getGroupList / getBuddyList / getLastMessageList 等无关方法，
   // 只回一个 {result:0,errMsg:"success"} 空壳让人以为成功——比报错更坏，全部拉黑。
   'get_group_admin_permissions',   // → getGroupList
   'get_group_admin_settings',      // → getGroupList

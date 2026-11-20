@@ -211,14 +211,49 @@ ffmpeg 取自 `PATH`，也可以用环境变量 `OPENQQ_FFMPEG` 指定。`silk-w
 
 `get_login_info` 目前返回账号的 QQ 号，昵称是空字符串。`get_status` 目前只反映原生会话是否可用，没有做完整的网络连通性探测。
 
+## 需要 SSO 通道的动作
+
+下面这些动作走的是 QQ 的 SSO 通道，需要额外提供一个发送组件（可选，**不随本仓库和发行包分发**，见 README 的说明）。没有这个组件时它们会如实返回 `1404` 与「通道未就绪」，其余动作不受影响：
+
+- 协议层动作：`send_poke`、`sso_pipe_send`、`sso_pipe_status`
+- OIDB 动作表里的群管理 / 群文件 / 群相册 / 群待办 / Ark 卡片 / p_skey 等
+- QZone 读写（需要先拿到 `p_skey`）
+
+`sso_pipe_send` 允许调用方发任意命令名和任意十六进制包体，是这套能力里权限最大的一个口子：**它等同于「以你的 QQ 身份发任意协议请求」**。只在完全信任调用方时启用；前置层与 OpenQQ 之间的令牌是它唯一的访问控制。
+
+## 危险动作与 confirm_danger
+
+不可撤回、且会影响他人的动作（踢人、退群、删好友、改群名、设置管理员、删群文件/群相册等）默认**只构造不发送**，返回 `1404` 并把构造好的包体（`bodyHex`）一并给出，便于核对字段。
+
+要真正执行必须显式带 `confirm_danger: true`。
+
+注意这个参数的性质：它只是调用方自己传的一个布尔值，作用域是**防误触**，不是授权。任何能调用动作的客户端都能带上它，所以不要把它当成权限边界；真正的边界是 OneBot 访问令牌和「谁能连上这个服务」。
+
+## download_file 的限制
+
+- 只接受 `http` / `https`，且必须是公网地址。内网、回环、链路本地、云元数据地址（`169.254.169.254`）、`localhost` / `.local` / `.internal` 这类主机名一律拒绝。
+- **不跟随重定向**：目标返回 3xx 直接失败。否则一个公网地址可以 302 到内网，绕过上面的检查。
+- 单次响应上限默认 32 MiB，可用 `max_bytes` 调整（1 B ~ 64 MiB），超限即中断，不会把整份响应读进内存。
+- 落盘目录固定为 `<openqq>/data/downloads/`，文件名只保留安全字符（`/`、`\` 会被替换，开头的 `.` 会被去掉），因此 `../` 跳不出这个目录。
+- `Host`、`Connection`、`Transfer-Encoding` 这类会改变连接本身的请求头会被丢弃，其余（`Referer`、`Authorization` 等）原样转发。
+
+## 凭据类动作
+
+`get_cookies`、`get_credentials`、`get_clientkey`、`get_csrf_token`、`get_pskey` 会把登录凭据（`skey` / `p_skey` / `clientKey` / 由它们算出的 `g_tk`）交给调用方。
+
+也就是说：**任何持有 OneBot 访问令牌的客户端都能拿到这些凭据**，等价于拿到该 QQ 号在相关域上的登录态。部署时请把 OneBot 的令牌和端口当作凭据本身来保护，不要把服务暴露到不受信任的网络。
+
 ## 测试情况
 
 所有动作都已在 QQ `9.9.37-54395` 上用测试群和测试账号实测。有两点以客户端显示为准：`send_like` 返回成功但无法读回；关闭全员禁言时 QQ 返回成功，但不会推送通知。
 
-参数校验、UID 转换、并发回执匹配、媒体处理、超时和断线保护都有自动测试。
+参数校验、UID 转换、并发回执匹配、媒体处理、超时和断线保护都有自动测试。OIDB 的 protobuf 编码（`encodeBySchema`、`wrapOidbBase`、`pb-mini` 的整数校验）、`download_file` 的地址与文件名净化、`nativeRefusal` 的失败文案识别都有不依赖真实 QQ 的单元测试。
 
 ## 尚未实现
 
-戳一戳发送、设置群头衔（这个版本的 QQ 没有现成接口）、音乐卡片、合并转发发送、匿名相关动作、群荣誉等。
+- `set_group_anonymous` / `set_group_anonymous_ban`：QQ 内核没有对应接口，**回「尚未支持动作」而不是假装成功**。
+- 设置群头衔：这个版本的 QQ 没有可用的 set 接口（只有 get）。
+- 音乐卡片、群荣誉：内核与协议层都没有稳定入口。
+- 四个 `*_stream` 流式下载动作：OneBot 的 HTTP 前置层没有流式帧协议，需要先扩协议；请用 `download_file` 代替。
 
 协议字段参考 [OneBot v11 公开 API](https://github.com/botuniverse/onebot-11/blob/master/api/public.md)。输入状态、申请 `flag` 的格式是 OpenQQ 的扩展。

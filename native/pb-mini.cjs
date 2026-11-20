@@ -1,23 +1,52 @@
 'use strict';
-// 极简 protobuf 编码器（2026-11-19）：群相册那批 trpc 命令要手搓 body，
-// 只做最小集：varint / string / bytes / message，够用就行。
-function varint(n) {
+
+// 极简 protobuf 编码器。整个 native/ 只有这一份实现（oidb-actions.cjs 与 sso-pipe.cjs 都从这里取），
+// 免得两份实现各自处理非法输入。
+//
+// 整数一律走 BigInt：Number 在 2^53 以上会悄悄丢精度，而 QQ 号、群号、msgId 都在那个量级附近。
+// 非法输入直接抛错，不编成 0 —— 把一个非法 group_id 编成 0 再发给服务端，比当场失败危险得多。
+
+function toBigInt(value, what = 'protobuf 整数字段') {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value)) throw new TypeError(`${what} 必须是整数，收到 ${value}`);
+    if (!Number.isSafeInteger(value)) throw new TypeError(`${what} 超出安全整数范围（2^53），请传字符串或 BigInt：${value}`);
+    return BigInt(value);
+  }
+  if (typeof value === 'string' && /^[+-]?\d+$/.test(value)) return BigInt(value);
+  throw new TypeError(`${what} 必须是整数，收到 ${typeof value}`);
+}
+
+// protobuf 的 uint64 用补码表示负数，所以负数按 64 位取模编码，而不是写 0。
+function varint(value, what) {
+  let v = toBigInt(value, what);
+  if (v < 0n) v = BigInt.asUintN(64, v);
   const out = [];
-  let v = Number(n);
-  if (!Number.isFinite(v) || v < 0) v = 0;
-  v = Math.floor(v);
-  while (v > 127) { out.push((v & 127) | 128); v = Math.floor(v / 128); }
-  out.push(v);
+  while (v > 0x7fn) {
+    out.push(Number(v & 0x7fn) | 0x80);
+    v >>= 7n;
+  }
+  out.push(Number(v));
   return Buffer.from(out);
 }
-function tag(field, wire) { return varint((field << 3) | wire); }
-function vint(field, n) { return Buffer.concat([tag(field, 0), varint(n)]); }
+
+function tag(field, wire) {
+  const fieldNo = toBigInt(field, 'protobuf 字段号');
+  if (fieldNo < 0n || fieldNo > 0x1fffffffn) throw new RangeError(`protobuf 字段号越界：${field}`);
+  if (wire < 0 || wire > 5) throw new RangeError(`protobuf wire type 非法：${wire}`);
+  return varint((fieldNo << 3n) | BigInt(wire));
+}
+
+const vint = (field, value, what) => Buffer.concat([tag(field, 0), varint(value, what || `字段 ${field}`)]);
+
 function str(field, s) {
-  const b = Buffer.from(String(s == null ? '' : s), 'utf8');
-  return Buffer.concat([tag(field, 2), varint(b.length), b]);
+  const body = Buffer.from(s == null ? '' : String(s), 'utf8');
+  return Buffer.concat([tag(field, 2), varint(body.length), body]);
 }
+
 function bytes(field, b) {
-  const buf = Buffer.isBuffer(b) ? b : Buffer.from(b || []);
-  return Buffer.concat([tag(field, 2), varint(buf.length), buf]);
+  const body = Buffer.isBuffer(b) ? b : Buffer.from(b || []);
+  return Buffer.concat([tag(field, 2), varint(body.length), body]);
 }
-module.exports = { varint, tag, vint, str, bytes };
+
+module.exports = { toBigInt, varint, tag, vint, str, bytes };
