@@ -1,39 +1,44 @@
 'use strict';
 
+const nodePath = require('node:path');
+const nodeFs = require('node:fs');
 const { createEventReceiver } = require('./events.cjs');
-// ── 热重载（2026-11-19）：actions.cjs 不被打包进 session.cjs，而是运行时 require。
-// 改完 dist/native/actions.cjs 后，下一次动作调用会自动重载，不需要重启 QQ 或 OpenQQ。
-const __path = require('node:path');
-const __fs = require('node:fs');
-const __actionsPath = __path.join(__dirname, 'actions.cjs');
-// ⚠️ 热重载必须连**依赖的兄弟模块**一起清缓存，否则 actions.cjs 重载了、
-// 但它内部 require('./oidb-actions.cjs') 还是旧的那份 —— 表现是"表里明明加了动作，却回 尚未支持动作"。
-const __depNames = ['actions.cjs', 'admin.cjs', 'oidb-actions.cjs', 'pb-mini.cjs', 'sso-pipe.cjs', 'cq.cjs', 'elements.cjs', 'common.cjs'];
-function __loadActions() {
-  for (const name of __depNames) {
-    const p = __path.join(__dirname, name);
-    try { delete require.cache[require.resolve(p)]; } catch (e) { /* 文件不存在就跳过 */ }
+
+// actions.cjs 不被打包进 session.cjs，而是运行时 require：改完 dist/native/actions.cjs 后，
+// 下一次动作调用就会自动重载，不需要重启 QQ 或 OpenQQ。
+const actionsPath = nodePath.join(__dirname, 'actions.cjs');
+
+// 热重载必须连依赖的兄弟模块一起清缓存，否则 actions.cjs 换新了、它 require 的
+// oidb-actions.cjs 还是旧的那份——表现是「表里明明加了动作，却回 尚未支持动作」。
+// 这里不写死模块名：清掉同目录下所有已载入的 .cjs，新增模块不用回来改这份清单。
+function loadActions() {
+  let names;
+  try { names = nodeFs.readdirSync(__dirname); } catch { names = ['actions.cjs']; }
+  for (const name of names) {
+    if (!name.endsWith('.cjs')) continue;
+    const full = nodePath.join(__dirname, name);
+    if (full === __filename) continue;
+    try { delete require.cache[require.resolve(full)]; } catch { /* 未载入或文件不存在，跳过 */ }
   }
-  return require(__actionsPath);
+  return require(actionsPath);
 }
-function __maybeReloadActions(attachment) {
-  if (!attachment || !attachment.__actionsCtx) { globalThis.__hotDebug = { why: 'no-ctx' }; return; }
+
+// 只在 mtime 变了才重载；重载失败保留旧 handler，并留一条可查的日志（不静默吞掉）。
+function reloadActionsIfChanged(attachment) {
+  if (!attachment?.actionsContext) return;
+  let stamp;
+  try { stamp = nodeFs.statSync(actionsPath).mtimeMs; } catch { return; }
+  if (attachment.actionsStamp === stamp) return;
   try {
-    const st = __fs.statSync(__actionsPath);
-    const same = attachment.__actionsStamp === st.mtimeMs;
-    globalThis.__hotDebug = { stamp: attachment.__actionsStamp, mtime: st.mtimeMs, same };
-    if (same) return;
-    const fresh = __loadActions();
-    attachment.actions = fresh.createActionHandler(...attachment.__actionsCtx);
-    attachment.__actionsStamp = st.mtimeMs;
-    globalThis.__hotDebug.reloaded = true;
-    console.error('[hot] reloaded actions.cjs mtime=' + st.mtimeMs);
-  } catch (e) {
-    globalThis.__hotDebug = { why: 'throw', error: String((e && e.message) || e) };
-    console.error('[hot] reload failed: ' + String((e && e.stack) || e));
+    attachment.actions = loadActions().createActionHandler(...attachment.actionsContext);
+    attachment.actionsStamp = stamp;
+    console.error(`[hot] reloaded actions.cjs mtime=${stamp}`);
+  } catch (error) {
+    console.error(`[hot] reload failed: ${(error && error.stack) || error}`);
   }
 }
-const { createActionHandler } = __loadActions();
+
+const { createActionHandler } = loadActions();
 
 // Only the client-created session is observed; login tickets never leave QQ.
 function createSessionHook(report) {
@@ -73,11 +78,11 @@ function createSessionHook(report) {
       attached.set(session, attachment);
       const current = () => active && attached.get(session) === attachment;
       const receive = createEventReceiver(session, self, emit, current);
-      attachment.__actionsCtx = [session, self, current, {
+      attachment.actionsContext = [session, self, current, {
         expandForward: receive.expandForward, fetchMessage: receive.fetchMessage, friendList: receive.friendList, lookupRecent: receive.lookupRecent, resolveMedia: receive.resolveMedia, record: receive.record, groups: receive.groups,
       }];
-      attachment.actions = createActionHandler(...attachment.__actionsCtx);
-      try { attachment.__actionsStamp = __fs.statSync(__actionsPath).mtimeMs; } catch { attachment.__actionsStamp = 0; }
+      attachment.actions = createActionHandler(...attachment.actionsContext);
+      try { attachment.actionsStamp = nodeFs.statSync(actionsPath).mtimeMs; } catch { attachment.actionsStamp = 0; }
       for (const [source, getter, add, remove] of [
         ['msg', 'getMsgService', 'addKernelMsgListener', 'removeKernelMsgListener'],
         ['buddy', 'getBuddyService', 'addKernelBuddyListener', 'removeKernelBuddyListener'],
@@ -213,7 +218,7 @@ function createSessionHook(report) {
   async function execute(request) {
     const sessions = [...attached.values()].filter(value => value.ready);
     if (!active || sessions.length !== 1) throw Object.assign(new Error('需要唯一的已初始化 QQ 会话'), { retcode: 1502 });
-    __maybeReloadActions(sessions[0]);
+    reloadActionsIfChanged(sessions[0]);
     return sessions[0].actions.execute(request);
   }
   // 断线重连后重放会话状态：session_ready 只在 QQ 会话初始化时产生一次，
@@ -230,9 +235,20 @@ function createSessionHook(report) {
 function startNative(config, wrapper) {
   if (globalThis.__openqq_hook) throw new Error('OpenQQ 已挂接');
   let socket = null; // 可重连：断线后换新 socket，不再 dispose
+  // 丢弃计数：OpenQQ 重启期间事件没有去处，这是设计上的降级，但必须可查 ——
+  // 静默 return 会让「这次重启到底丢了多少条消息」永远无从判断。
+  let droppedEvents = 0;
+  let lastDropLog = 0;
+  function dropEvent(reason) {
+    droppedEvents++;
+    const now = Date.now();
+    if (now - lastDropLog < 60000) return;
+    lastDropLog = now;
+    console.error(`[ipc] event dropped (${reason}); dropped so far=${droppedEvents}`);
+  }
   function write(event) {
-    if (!socket || socket.destroyed) return; // 没连接就丢弃事件，不崩
-    if (socket.writableLength > 1024 * 1024) { return; }
+    if (!socket || socket.destroyed) { dropEvent('no connection'); return; }
+    if (socket.writableLength > 1024 * 1024) { dropEvent('backlog over 1 MiB'); return; }
     let frame;
     try {
       frame = JSON.stringify(event, (_key, value) => value instanceof Map ? Object.fromEntries(value)
@@ -253,8 +269,9 @@ function startNative(config, wrapper) {
       delete globalThis.__openqq_hook;
       if (socket) { try { socket.destroy(); } catch {} }
     },
+    // 供诊断读取：被丢弃的事件总数。
+    droppedEvents() { return droppedEvents; },
   };
-  let busy = 0;
   let gen = 0;
   let retryTimer = null;
   // 重连间隔：要明显短于服务端等 QQ 连回来的窗口（默认 6 秒），又不至于空转。
@@ -274,9 +291,10 @@ function startNative(config, wrapper) {
     if (disposed) return;
     const s = require('node:net').createConnection(config.pipe);
     const my = ++gen;
+    // 在途动作计数绑在这一代连接上：断线后旧连接上还没结束的动作减的是自己的计数，
+    // 不会把新连接的计数减成负数（那会让 busy >= 32 的并发上限失效）。
+    let inflight = 0;
     socket = s;
-    // 新连接上没有任何在途动作，计数归零；否则断线时若正好压着 32 个，重连后会一直被拒帧。
-    busy = 0;
     s.on('close', () => { if (my === gen) scheduleReconnect(); });
     s.on('error', () => { try { s.destroy(); } catch { /* 交给 close 去重连 */ } });
     s.setEncoding('utf8');
@@ -291,9 +309,9 @@ function startNative(config, wrapper) {
         let frame;
         try {
           frame = JSON.parse(line);
-          if (frame?.type !== 'action' || !/^[a-f0-9]{32}$/.test(frame.id) || busy >= 32) throw new Error('无效动作帧');
+          if (frame?.type !== 'action' || !/^[a-f0-9]{32}$/.test(frame.id) || inflight >= 32) throw new Error('无效动作帧');
         } catch { try { s.destroy(); } catch { /* 收到坏帧，断开等重连 */ } return; }
-        busy++;
+        inflight++;
         hook.execute(frame.request).then(data => {
           // hook 有两种返回形态：上游 handler 给裸数据，我们新增的 handler 直接给 OneBot 回执。
           // 后者必须原样透传——无条件包一层 { status:'ok', retcode:0 } 会把失败吞掉，
@@ -304,7 +322,7 @@ function startNative(config, wrapper) {
           if (!disposed) write({ type: 'action_result', id: frame.id, response: replay ? data : { status: 'ok', retcode: 0, data } });
         }, error => {
           if (!disposed) write({ type: 'action_result', id: frame.id, response: { status: 'failed', retcode: error.retcode ?? 1500, data: null, message: error.message } });
-        }).finally(() => { busy--; });
+        }).finally(() => { inflight--; });
       }
     });
     s.write(JSON.stringify({ type: 'hello', token: config.token, pid: process.pid }) + '\n');

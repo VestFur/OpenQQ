@@ -1,13 +1,12 @@
 import { parseArgs } from 'node:util';
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, writeFileSync, renameSync, readFileSync, createWriteStream } from 'node:fs';
+import { mkdirSync, writeFileSync, renameSync, readFileSync, createWriteStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
 import { inspectQQ, resolveLinuxWrapper, bootstrapInput, verifiedVersions } from './qq.mjs';
 import { detectEnvironment, isQQProcessRunning, probeNative } from './env.mjs';
-import { randomBytes } from 'node:crypto';
-import { createNativeChannel, persistentChannelPath } from './ipc.mjs';
+import { createNativeChannel, ensureIpcParams } from './ipc.mjs';
 import { createEventConverter } from './onebot.mjs';
 import { createIdStore } from './idstore.mjs';
 import { dispatchAction, redactRequest, redactResponse } from './actions.mjs';
@@ -76,8 +75,8 @@ function checkClient(qq) {
   }
   const native = probeNative(projectDir);
   if (!native.ready) throw new Error(native.error);
-  // 已经注入过（有持久化 IPC 端点）时，QQ 在运行也允许启动：改为附着，不重启 QQ。
-  if (isQQProcessRunning() && !hasPersistedIpc()) throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+  // 这里不判断 QQ 是否在运行：在运行也可能是一个已经注入了原生脚本的实例，那样只需附着。
+  // 到底能不能附着由 start() 里「等它连回固定端点」这一步决定，失败时再给出退出 QQ 的提示。
   return native;
 }
 
@@ -88,44 +87,37 @@ function oneBotAccess(config) {
   return parts.join(' · ') + (config.ws.enabled || config.http?.enabled ? '（令牌见 WebUI 接入配置）' : '：QQ 就绪后连接');
 }
 
-// ipc.json 只在「地址与当前平台一致」时才算有效：换了平台或路径放不下时按首次注入处理，
-// 免得拿一个本机根本不存在的端点去等 QQ 连回来。
-function readIpcParams() {
-  try {
-    const saved = JSON.parse(readFileSync(join(runtimeDir, 'ipc.json'), 'utf8'));
-    if (saved?.pipe !== persistentChannelPath(projectDir)) return null;
-    if (typeof saved?.token !== 'string' || saved.token.length < 32) return null;
-    return saved;
-  } catch { return null; }
-}
-
-function hasPersistedIpc() {
-  return Boolean(readIpcParams());
-}
-
-// 固定 IPC 端点：地址与令牌持久化到 .runtime/ipc.json。
-// QQ 侧的 native/session.cjs 断线后会重连到同一地址，因此重启 OpenQQ 不再需要重启 QQ。
-function stableIpcParams() {
-  const saved = readIpcParams();
-  if (saved) return saved;
-  const file = join(runtimeDir, 'ipc.json');
-  const fresh = { pipe: persistentChannelPath(projectDir), token: randomBytes(32).toString('hex') };
-  try {
-    mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(file, JSON.stringify(fresh, null, 2), { mode: 0o600 });
-    // 文件已存在时 mode 不生效，补一次 chmod（Windows 上是 no-op）。
-    chmodSync(file, 0o600);
-  } catch { /* 写不进去就本次内生效，下次重新生成 */ }
-  return fresh;
-}
+// ipc.json 的读取与生成在 src/ipc.mjs（ensureIpcParams）：端点名是随机的，只持久化复用，
+// 不由项目路径推导。这样同一份安装下次启动仍落到同一地址，别的进程却猜不到名字。
 
 async function start(qq, config, existingWebUI) {
   const native = checkClient(qq);
   if (!qq.targetMatch) {
     out.log('warn', `当前 QQ 版本 ${qq.version} 未经过完整实机验证（已验证版本：${verifiedVersions.join('、')}），如遇异常请查看运行诊断`);
   }
-  const ipcParams = stableIpcParams();
+  let current = { phase: 'starting', version: qq.version, bootstrap: 'cpp-native' };
+  const ipcParams = ensureIpcParams(runtimeDir);
   const channel = await createNativeChannel(ipcParams.pipe, ipcParams.token);
+  // 优先附着：QQ 已在运行、且里面那份原生脚本还在（它会自己连回固定端点）时，等它连回来，完全不碰 QQ。
+  // 连不回来就说明那个 QQ 不是我们注入的实例。这时既不能附着，也不能再拉一个启动器（会往一个已经
+  // 跑着的 QQ 里重复注入），只能请用户先退出 QQ —— 也就是改造前那条原始错误的含义。
+  let attached = false;
+  if (isQQProcessRunning()) {
+    out.log('info', '检测到 QQ 正在运行，尝试直接附着（不重启 QQ）…');
+    attached = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve(false), 6000);
+      channel.events.once('connected', info => {
+        clearTimeout(timer);
+        current = { ...current, phase: 'hook_installed', pid: info.pid };
+        resolve(true);
+      });
+    });
+    if (!attached) {
+      await channel.close();
+      throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+    }
+    out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
+  }
   let network;
   // message_id values survive a restart: the mapping to QQ's own ids is kept in .runtime/ids.json.
   const convert = createEventConverter({ mediaUrl: (filePath, fileName) => network?.mediaUrl(filePath, fileName) ?? null,
@@ -133,7 +125,6 @@ async function start(qq, config, existingWebUI) {
   // Sources of image / voice / video / file segments (local path, base64, URL) are fetched into this folder before sending.
   const media = createMediaPreparer({ dir: join(runtimeDir, 'media') });
   media.sweep().catch(() => {});
-  let current = { phase: 'starting', version: qq.version, bootstrap: 'cpp-native' };
   let webui;
   const execute = async (request, source) => {
     const started = performance.now();
@@ -221,39 +212,28 @@ async function start(qq, config, existingWebUI) {
   });
   channel.events.once('disconnected', finish);
   channel.events.on('failure', reject);
-  // 优先附着：QQ 已在运行且持有固定 IPC 端点时，等它自己连回来，完全不碰 QQ。
   let driver = null;
-  let attached = false;
-  if (isQQProcessRunning()) {
-    out.log('info', '检测到 QQ 正在运行，尝试直接附着（不重启 QQ）…');
-    attached = await new Promise(resolve => {
-      const timer = setTimeout(() => resolve(false), 6000);
-      channel.events.once('connected', () => { clearTimeout(timer); resolve(true); });
-    });
-    if (attached) out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
-    else out.log('warn', '附着失败：QQ 未连回固定 IPC 端点，将按原流程重启 QQ 挂接');
-  }
   if (!attached) {
-  const driverEnv = values['no-sandbox'] ? { ...process.env, OPENQQ_QQ_NO_SANDBOX: '1' } : process.env;
-  driver = spawn(native.launcher, [], {
-    windowsHide: true, env: driverEnv, stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  const wrapper = resolveLinuxWrapper(qq);
-  // Keep IPC token and pipe path out of process command-line arguments.
-  driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll,
-    payload: join(projectDir, 'native/session.cjs'), pipe: channel.path, token: channel.token }));
-  // QQ inherits the bootstrap's stdio, so its own console output arrives here as well: keep all of it in
-  // .runtime/qq.log and show only OpenQQ's bootstrap stages (QQ lines appear with /verbose).
-  for (const stream of [driver.stdout, driver.stderr]) {
-    stream.on('data', chunk => { if (!qqLog.writableEnded) qqLog.write(chunk); });
-    createInterface({ input: stream, crlfDelay: Infinity }).on('line', line => out.native(line));
-  }
-  driver.stdin.on('error', () => {});
-  driver.once('error', reject);
-  driver.once('exit', (code, signal) => {
-    if (code !== 0) reject(new Error(`原生引导器退出（${signal ?? code}）；请查看上方原生引导日志`));
-  });
-  out.log('info', `以正常参数启动 QQ ${qq.version}（独立原生挂接，无 Inspector 端口）`);
+    const driverEnv = values['no-sandbox'] ? { ...process.env, OPENQQ_QQ_NO_SANDBOX: '1' } : process.env;
+    driver = spawn(native.launcher, [], {
+      windowsHide: true, env: driverEnv, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const wrapper = resolveLinuxWrapper(qq);
+    // Keep IPC token and pipe path out of process command-line arguments.
+    driver.stdin.write(bootstrapInput({ executable: qq.executable, wrapper, dll: native.dll,
+      payload: join(projectDir, 'native/session.cjs'), pipe: channel.path, token: channel.token }));
+    // QQ inherits the bootstrap's stdio, so its own console output arrives here as well: keep all of it in
+    // .runtime/qq.log and show only OpenQQ's bootstrap stages (QQ lines appear with /verbose).
+    for (const stream of [driver.stdout, driver.stderr]) {
+      stream.on('data', chunk => { if (!qqLog.writableEnded) qqLog.write(chunk); });
+      createInterface({ input: stream, crlfDelay: Infinity }).on('line', line => out.native(line));
+    }
+    driver.stdin.on('error', () => {});
+    driver.once('error', reject);
+    driver.once('exit', (code, signal) => {
+      if (code !== 0) reject(new Error(`原生引导器退出（${signal ?? code}）；请查看上方原生引导日志`));
+    });
+    out.log('info', `以正常参数启动 QQ ${qq.version}（独立原生挂接，无 Inspector 端口）`);
   }
   const terminal = out.pretty && Boolean(process.stdin.isTTY);
   const input = startCommandInput({
