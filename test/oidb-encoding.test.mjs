@@ -103,3 +103,48 @@ test('whole-group setting rewrites stay un-sent until confirmed', () => {
   const read = actions.validateAction({ action: 'get_group_todo_list', params: { group_id: 123456 } });
   assert.equal(read.kind, 'sso_pipe');
 });
+
+test('download_file refuses non-public targets before anything is fetched', () => {
+  const check = params => actions.validateAction({ action: 'download_file', params });
+  // 放行任意 URL 会让这个动作变成 SSRF 跳板：内网、链路本地、云元数据地址都要挡住。
+  for (const url of [
+    'http://127.0.0.1:8080/x',
+    'http://169.254.169.254/latest/meta-data/',
+    'http://localhost/a',
+    'http://foo.localhost/a',
+    'http://service.internal/a',
+    'http://10.1.2.3/a',
+    'http://172.16.0.1/a',
+    'http://192.168.1.1/a',
+    'http://100.64.0.1/a',
+    'http://0.0.0.0/a',
+    'http://[::1]/a',
+    'http://[fe80::1]/a',
+    'file:///c:/windows/win.ini',
+    'ftp://example.com/a',
+    'http://user:pass@example.com/a',
+  ]) {
+    assert.throws(() => check({ url }), /download_file/, `应当拒绝 ${url}`);
+  }
+  const ok = check({ url: 'https://example.com/a', name: '../../evil.txt', headers: { Host: 'x', Referer: 'r' } });
+  assert.equal(ok.kind, 'download_file');
+  // basename 挡不住 '..'，文件名要单独净化，否则落盘路径会跳出下载目录。
+  assert.equal(ok.name, '_.._evil.txt');
+  // 会改变连接目标的头被丢掉，其余原样保留。
+  assert.deepEqual(ok.headers, { Referer: 'r' });
+  assert.equal(ok.maxBytes, 32 * 1024 * 1024);
+  assert.throws(() => check({ url: 'https://example.com/a', max_bytes: 1e9 }), /max_bytes/);
+  assert.throws(() => check({}), /url 或 base64/);
+});
+
+test('forwarding needs a reference to a message seen during this run', () => {
+  // OneBot 的 message_id 是自增序号，不是 QQ 真 msgId；真 msgId + peerUid 只能来自 openqq_ref。
+  // 拿不到引用时如实拒绝，不要傻等超时。
+  for (const action of ['forward_friend_single_msg', 'forward_group_single_msg']) {
+    assert.throws(
+      () => actions.validateAction({ action, params: { user_id: 1, group_id: 1 } }),
+      /message_id 无效或引用的消息已过期/,
+      action,
+    );
+  }
+});

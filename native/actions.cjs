@@ -1,6 +1,6 @@
 'use strict';
 
-const { fail, identifier, nativeId } = require('./common.cjs');
+const { fail, identifier, integer, nativeId } = require('./common.cjs');
 const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
@@ -22,6 +22,79 @@ function nativePeerOf(params) {
     return { chatType: 1, peerUid: String(user), guildId: '' };
   }
   throw new Error('需要 group_id 或 user_id（或 openqq_ref.peerUid）');
+}
+
+// download_file 只接受公网 http(s)。允许任意 URL 会让这个动作变成 SSRF 跳板：打到内网、
+// 127.0.0.1、链路本地地址，或者云环境的元数据地址（169.254.169.254）。
+const PRIVATE_V4 = [
+  [/^0\./, '0.0.0.0/8'],
+  [/^10\./, '10.0.0.0/8'],
+  [/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, '100.64.0.0/10'],
+  [/^127\./, '127.0.0.0/8'],
+  [/^169\.254\./, '169.254.0.0/16'],
+  [/^172\.(1[6-9]|2\d|3[01])\./, '172.16.0.0/12'],
+  [/^192\.168\./, '192.168.0.0/16'],
+];
+const PRIVATE_V6 = [/^::$/, /^::1$/, /^f[cd]/, /^fe[89ab]/, /^::ffff:/];
+
+function assertPublicHttpUrl(raw) {
+  let url;
+  try { url = new URL(String(raw)); } catch { throw fail('download_file 的 url 不是合法地址'); }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw fail('download_file 只支持 http/https');
+  if (url.username || url.password) throw fail('download_file 不接受带账号密码的 url');
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) throw fail('download_file 的 url 没有主机名');
+  if (host === 'localhost' || /\.(localhost|local|internal|lan|home\.arpa)$/.test(host)) {
+    throw fail(`download_file 拒绝本机或内网主机名：${host}`);
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    for (const [pattern, range] of PRIVATE_V4) {
+      if (pattern.test(host)) throw fail(`download_file 拒绝内网地址（${range}）：${host}`);
+    }
+  } else if (host.includes(':')) {
+    for (const pattern of PRIVATE_V6) {
+      if (pattern.test(host)) throw fail(`download_file 拒绝内网 IPv6 地址：${host}`);
+    }
+  }
+  return url;
+}
+
+// 文件名只留安全字符：basename 挡不住 '..'，而 '..' 会让落盘路径跳出 data/downloads。
+function safeDownloadName(raw) {
+  const cleaned = String(raw ?? '')
+    .replace(/[\\/]/g, '_')
+    .replace(/[^\w.\- ]+/g, '_')
+    .replace(/^\.+/, '')
+    .trim()
+    .slice(0, 100);
+  return cleaned && cleaned !== '.' && cleaned !== '..' ? cleaned : '';
+}
+
+// 只拦会被 fetch 用来改变连接目标的头，其余（Referer / Authorization 等）原样保留。
+const BLOCKED_DOWNLOAD_HEADERS = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'upgrade', 'te']);
+function sanitizeDownloadHeaders(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || !key.trim()) continue;
+    if (BLOCKED_DOWNLOAD_HEADERS.has(key.trim().toLowerCase())) continue;
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    out[key.trim()] = String(value).slice(0, 2000);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// 边读边算，超过上限立刻停 —— 一次性 arrayBuffer 会把整份响应读进内存。
+async function readBodyCapped(response, maxBytes) {
+  if (!response.body) return Buffer.from(await response.arrayBuffer());
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of response.body) {
+    total += chunk.length;
+    if (total > maxBytes) throw new Error(`响应超过 ${maxBytes} 字节上限`);
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 // 原生方法直调表：动作名 → service 名 + 方法名 + 参数个数。
@@ -520,6 +593,27 @@ function validateAction(request) {
   // native_call（按任意 service/method 反射调用内核）已按 review 移除：
   // 它绕过所有白名单与危险守卫，只读 PR 不应携带这种入口。
   // 本地调试需要它时用 wip 分支（那里保留了全套调试入口）。
+      if (request.action === 'download_file') {
+    const url = String(params.url ?? '').trim();
+    const b64 = String(params.base64 ?? '').trim();
+    if (!url && !b64) throw fail('download_file 需要 url 或 base64', 1400);
+    if (url) assertPublicHttpUrl(url);
+    return {
+      kind: 'download_file', action: 'download_file',
+      url, base64: b64,
+      name: safeDownloadName(params.name),
+      headers: sanitizeDownloadHeaders(params.headers),
+      maxBytes: integer(params.max_bytes, 'max_bytes', 1, 64 * 1024 * 1024, 32 * 1024 * 1024),
+    };
+  }
+  if (request.action === 'forward_friend_single_msg' || request.action === 'forward_group_single_msg') {
+    const ref = nativeRef(params.openqq_ref);
+    if (!ref) throw fail(request.action + ' 的 message_id 无效或引用的消息已过期（仅支持本次运行期间收到的消息）', 1404);
+    const isGroup = request.action === 'forward_group_single_msg';
+    const target = String((isGroup ? params.group_id : params.user_id) ?? '').trim();
+    if (!target) throw fail(request.action + ' 需要 ' + (isGroup ? 'group_id' : 'user_id'), 1400);
+    return { kind: 'forward_send', action: request.action, source: ref, targetUin: target, targetChatType: isGroup ? 2 : 1 };
+  }
   if (!sendActions.includes(request.action)) throw fail('尚未支持动作: ' + request.action, 1404);
   let type = request.action === 'send_private_msg' ? 'private' : request.action === 'send_group_msg' ? 'group' : params.message_type;
   if (!type) {
@@ -829,6 +923,99 @@ function createActionHandler(session, self, current, options = {}) {
           message: String(error && error.message ? error.message : error).slice(0, 300) };
       }
     }
+    if (action.kind === 'download_file') {
+      // 落盘到 <openqq>/data/downloads/：这个目录只存下载结果，不会被当成代码或配置加载。
+      const fsMod = require('node:fs');
+      const pathMod = require('node:path');
+      const dir = pathMod.join(__dirname, '..', 'data', 'downloads');
+      fsMod.mkdirSync(dir, { recursive: true });
+      const dest = pathMod.join(dir, action.name || ('download-' + Date.now() + '.bin'));
+      let buf;
+      if (action.base64) {
+        buf = Buffer.from(String(action.base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
+        if (buf.length > action.maxBytes) {
+          return { status: 'failed', retcode: 1400, data: { action: 'download_file', size: buf.length },
+            message: `base64 内容超过 ${action.maxBytes} 字节上限` };
+        }
+      } else {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 60000);
+        if (timer.unref) timer.unref();
+        try {
+          // redirect: 'manual' —— 跟随重定向会让一个公网地址 302 到内网，绕过 validateAction 里的主机检查。
+          const res = await fetch(action.url, { headers: action.headers || {}, signal: ac.signal, redirect: 'manual' });
+          if (res.status >= 300 && res.status < 400) {
+            return { status: 'failed', retcode: 1400, data: { action: 'download_file', url: action.url, http: res.status },
+              message: '下载失败：目标返回重定向，download_file 不跟随（避免被导向内网）' };
+          }
+          if (!res.ok) {
+            return { status: 'failed', retcode: 1500, data: { action: 'download_file', url: action.url, http: res.status },
+              message: '下载失败：HTTP ' + res.status };
+          }
+          buf = await readBodyCapped(res, action.maxBytes);
+        } catch (error) {
+          return { status: 'failed', retcode: 1500, data: { action: 'download_file', url: action.url },
+            message: '下载失败：' + String(error && error.message ? error.message : error).slice(0, 160) };
+        } finally { clearTimeout(timer); }
+      }
+      fsMod.writeFileSync(dest, buf);
+      return { status: 'ok', retcode: 0, data: { action: 'download_file', file: dest, name: pathMod.basename(dest), size: buf.length } };
+    }
+    if (action.kind === 'forward_send') {
+      // 源消息：来自主进程附加的 openqq_ref，里面有真 msgId + 源会话的 peerUid（nativeRef 已校验格式）
+      const src = action.source;
+      // 目标会话：把 targetUin（QQ 号/群号）换成 peerUid。getUserDetailInfoByUin 是 argc==1 + 异步，必须 await。
+      let targetUid = '';
+      try {
+        const profileSvc = session.getProfileService();
+        const det = await profileSvc.getUserDetailInfoByUin(action.targetUin);
+        targetUid = String((det && det.detail && (det.detail.uid || (det.detail.simpleInfo && det.detail.simpleInfo.uid))) || '');
+      } catch (e) {
+        return { status: 'failed', retcode: 1500, data: { action: action.action, targetUin: action.targetUin },
+          message: 'getUserDetailInfoByUin 抛错：' + String(e && e.message ? e.message : e).slice(0, 140) };
+      }
+      if (!targetUid) {
+        return { status: 'failed', retcode: 1404, data: { action: action.action, targetUin: action.targetUin },
+          message: '拿不到目标 peerUid（getUserDetailInfoByUin 返回空 uid）' };
+      }
+      const msgSvc = session.getMsgService();
+      if (!msgSvc || typeof msgSvc.forwardMsg !== 'function') {
+        return { status: 'failed', retcode: 1404, data: { action: action.action }, message: 'Msg.forwardMsg 不可用' };
+      }
+      // QQ NT 的 forwardMsg(msgInfos, target, options, callback)。
+      // msgInfos 每项要 {msgId, msgSeq}；源消息的 peerUid/chatType 来自 openqq_ref。
+      const msgInfos = [{
+        msgId: String(src.msgId),
+        msgSeq: String(src.msgId),
+        peerUid: String(src.peerUid),
+        chatType: Number(src.chatType),
+      }];
+      const target = { chatType: action.targetChatType, peerUid: targetUid, guildId: '' };
+      const cbOut = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve({ __timeout: true }), 15000);
+        if (timer.unref) timer.unref();
+        try {
+          msgSvc.forwardMsg(msgInfos, target, {}, (...a) => { clearTimeout(timer); resolve(a.length <= 1 ? a[0] : a); });
+        } catch (e) {
+          clearTimeout(timer);
+          resolve({ __throw: String(e && e.message ? e.message : e).slice(0, 200) });
+        }
+      });
+      const ok = Boolean(cbOut) && !cbOut.__timeout && !cbOut.__throw && Number(cbOut.result ?? 0) === 0;
+      return {
+        status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500,
+        data: { action: action.action, sourceMsgId: String(src.msgId), targetUin: action.targetUin,
+          targetChatType: action.targetChatType, callback: cbOut },
+        ...(ok ? {} : { message: cbOut && cbOut.__timeout ? 'forwardMsg 15 秒无回调（内核没触发）'
+          : (cbOut && cbOut.__throw ? 'forwardMsg 抛错：' + cbOut.__throw : 'forwardMsg 回执非 0') }),
+      };
+    }
+        if (action.kind === 'forward') {
+          if (typeof options.expandForward !== 'function') throw fail('当前会话不支持获取合并转发', 1500);
+          const messages = await options.expandForward(action.ref);
+          ensure();
+          return { self, forward: { ref: action.ref, messages } };
+        }
     if (action.kind === 'oidb_dryrun') {
       // 只回报将要发送的字节，不发 —— 调用方看 sent:false 就知道没有副作用。
       // 必须走 throw：session.cjs 会把 return 值统一包成 retcode 0，
