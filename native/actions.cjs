@@ -114,13 +114,200 @@ const NATIVE_OPS = {
     return [{ uids: [id] }, null];
   } },
   nc_get_packet_status: { service: 'MSF', method: 'getMsfStatus', arity: 0, build: () => [] },
+
+  // ── 写入类动作 ──
+  delete_custom_face: { service: 'msg', method: 'deleteFavEmoji', arity: 1, build: p => [String(p.emoji_id ?? p.face_id ?? p.id ?? '')] },
+  check_url_safely: { service: 'msg', method: 'checkMsgWithUrl', arity: 1, build: p => [{ url: String(p.url ?? p.text ?? '') }] },
+  translate_en2zh: { service: 'RichMedia', method: 'translateEnWordToZn', arity: 1, build: p => [String(p.text ?? p.words ?? '')] },
+  set_qq_profile: { service: 'Profile', method: 'setNickName', arity: 1, build: p => [String(p.nickname ?? p.nick ?? '')] },
+  set_self_longnick: { service: 'Profile', method: 'setLongNick', arity: 1, build: p => [String(p.longNick ?? p.long_nick ?? p.sign ?? p.longnick ?? '')] },
+  set_group_remark: { service: 'Group', method: 'modifyGroupRemark', arity: 2, build: p => [String(p.group_id ?? ''), String(p.remark ?? p.card ?? p.name ?? '')] },
+  send_flash_msg: { service: 'FlashTransfer', method: 'sendFlashTransferMsg', arity: 1, build: p => {
+      const heads = Array.isArray(p.heads) ? p.heads : [];
+      const peer = p.peer_uid ?? p.peerUid ?? '';
+      if (!heads.length && !peer) return [{}];
+      return [{ MsgHeads: heads.length ? heads : [{ peerUid: String(peer), chatType: Number(p.group_id ? 2 : 1) }] }];
+    } },
+  delete_flash_file: { service: 'FlashTransfer', method: 'removeFolderFiles', arity: 2, build: p => [String(p.file_set_id ?? p.fileset ?? ''), Array.isArray(p.files) ? p.files : []] },
+  send_to_new_members: { service: 'Group', method: 'publishInstructionForNewcomers', arity: 3, build: p => [String(p.group_id ?? ''), String(p.content ?? p.message ?? p.text ?? ''), Array.isArray(p.at) ? p.at : []] },
+  mark_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: Number(p.group_id ? 2 : 1), peerUid: String(p.group_id ?? p.user_id ?? ''), guildId: '' }] },
+  mark_group_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: 2, peerUid: String(p.group_id ?? ''), guildId: '' }] },
+  mark_private_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: 1, peerUid: String(p.user_id ?? ''), guildId: '' }] },
+  set_msg_emoji_like: { service: 'msg', method: 'setMsgEmojiLikes', arity: 5, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    // `message_id` 是 OneBot 自增序号，不是 QQ 真 msgId（见 src/onebot.mjs 的 nextId++）。
+    // 真 msgId + peerUid 要从 `openqq_ref` 拿 —— 和 reply 段、get_forward_msg、forward_* 完全同一套机制。
+    const ref = nativeRef(p.openqq_ref);
+    const msgId = ref ? String(ref.msgId) : String(p.message_id ?? p.msg_id ?? '');
+    const peer = ref ? String(ref.peerUid) : nativePeerOf(p);
+    const isSet = p.is_set === undefined ? true : Boolean(p.is_set);
+    return [peer, msgId, String(p.emoji_id ?? p.emoji ?? ''), isSet ? 1 : 0, null];
+  } },
+  click_inline_button: { service: 'msg', method: 'clickInlineKeyboardButton', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ peer: nativePeerOf(p), msgId: String(p.message_id ?? ''), buttonId: String(p.button_id ?? p.id ?? '') }];
+  } },
+  click_tofu_button: { service: 'msg', method: 'clickTofuActionButton', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [nativePeerOf(p), String(p.message_id ?? ''), String(p.button_id ?? p.id ?? '')];
+  } },
+  set_mark_unread: { service: 'msg', method: 'setMarkUnreadFlag', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [nativePeerOf(p), Boolean(p.unread ?? true)];
+  } },
+  like_or_dislike_report: { service: 'msg', method: 'likeOrDislikeReportForMsg', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [nativePeerOf(p), String(p.message_id ?? ''), Number(p.like ?? 1)];
+  } },
+  translate_ptt_to_text: { service: 'msg', method: 'translatePtt2Text', arity: 3, cbIndex: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [nativePeerOf(p), String(p.message_id ?? ''), {}];
+  } },
+  recall_nudge: { service: 'msg', method: 'recallNudge', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [nativePeerOf(p), String(p.message_id ?? '')];
+  } },
+  add_group_essence: { service: 'Group', method: 'addGroupEssence', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), msgSeq: String(p.message_seq ?? p.msg_seq ?? ''), msgRandom: String(p.message_random ?? p.msg_random ?? '') }];
+  } },
+  remove_group_essence: { service: 'Group', method: 'removeGroupEssence', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), msgSeq: String(p.message_seq ?? p.msg_seq ?? ''), msgRandom: String(p.message_random ?? p.msg_random ?? '') }];
+  } },
+  publish_group_bulletin: { service: 'Group', method: 'publishGroupBulletin', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), content: String(p.content ?? p.text ?? '') }, String(p.content ?? p.text ?? ''), {}];
+  } },
+  delete_group_bulletin: { service: 'Group', method: 'deleteGroupBulletin', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), null];
+  } },
+  remind_group_bulletin_read: { service: 'Group', method: 'remindGroupBulletinRead', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), null];
+  } },
+  add_group_tag: { service: 'Group', method: 'addGroupTagToCategory', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    // 实测：字段名必须是 name（传 tag / tagName / tags 一律回 200012 "tag name is empty"）
+    return [{ groupCode: String(p.group_id ?? ''), name: String(p.name ?? p.tag ?? '') }];
+  } },
+  remove_group_tag: { service: 'Group', method: 'removeGroupTagFromCategory', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), name: String(p.name ?? p.tag ?? '') }];
+  } },
+  save_ai_voice: { service: 'Group', method: 'saveAIVoice', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), voiceId: String(p.voice_id ?? ''), voiceName: String(p.voice_name ?? '') }];
+  } },
+  approval_friend_request: { service: 'Buddy', method: 'approvalFriendRequest', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ friendUid: String(p.uid ?? p.user_id ?? p.uin ?? ''), reqTime: String(p.flag ?? p.req_time ?? ''), accept: Boolean(p.approve ?? true) }];
+  } },
+  approval_doubt_buddy: { service: 'Buddy', method: 'approvalDoubtBuddyReq', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.uin ?? p.user_id ?? ''), Boolean(p.approve ?? true), null];
+  } },
+  del_buddy: { service: 'Buddy', method: 'delBuddy', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ friendUid: String(p.user_id ?? p.uin ?? '') }];
+  } },
+  set_buddy_remark: { service: 'Buddy', method: 'setBuddyRemark', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ uid: String(p.user_id ?? p.uin ?? ''), remark: String(p.remark ?? '') }];
+  } },
+  req_to_add_friends: { service: 'Buddy', method: 'reqToAddFriends', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ uin: String(p.user_id ?? p.uin ?? ''), msg: String(p.comment ?? p.message ?? '') }];
+  } },
+  set_like_status: { service: 'OnlineStatus', method: 'setLikeStatus', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ uin: String(p.user_id ?? p.uin ?? ''), status: Number(p.status ?? 0) }];
+  } },
+  check_like_status: { service: 'OnlineStatus', method: 'checkLikeStatus', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ uin: String(p.user_id ?? p.uin ?? '') }];
+  } },
+  do_qun_like: { service: 'Album', method: 'doQunLike', arity: 5, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), String(p.uin ?? ''), Number(p.count ?? 1), String(p.cookie ?? ''), null];
+  } },
+  trans_group_file: { service: 'RichMedia', method: 'transGroupFile', arity: 2, cbIndex: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), fileId: String(p.file_id ?? ''), busId: Number(p.bus_id ?? 102) }, null];
+  } },
+  rename_group_file: { service: 'RichMedia', method: 'renameGroupFile', arity: 5, cbIndex: 4, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), String(p.file_id ?? ''), String(p.new_name ?? p.name ?? ''), Number(p.bus_id ?? 102), null];
+  } },
+  image_translate: { service: 'RichMedia', method: 'imageTranslate', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.image_path ?? p.file ?? ''), String(p.source_lang ?? 'auto'), String(p.target_lang ?? 'zh')];
+  } },
+  clear_group_notifies: { service: 'Group', method: 'clearGroupNotifies', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
+  } },
+  operate_sys_notify: { service: 'Group', method: 'operateSysNotify', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), notifySeq: String(p.seq ?? p.flag ?? ''), accept: Boolean(p.approve ?? true) }, {}];
+  } },
+  invite_to_group: { service: 'Group', method: 'inviteToGroup', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), Array.isArray(p.user_ids) ? p.user_ids.map(String) : [String(p.user_id ?? '')]];
+  } },
+  del_buddy_req: { service: 'Buddy', method: 'delBuddyReq', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ friendUid: String(p.uid ?? p.user_id ?? ''), reqTime: String(p.flag ?? '') }];
+  } },
+  set_block: { service: 'Buddy', method: 'setBlock', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.uid ?? p.user_id ?? ''), Boolean(p.block ?? true)];
+  } },
+  is_blocked: { service: 'Buddy', method: 'isBlocked', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.uid ?? p.user_id ?? '')];
+  } },
+  upload_file_stream: { service: 'RichMedia', method: 'onlyUploadFile', arity: 2, cbIndex: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ filePath: String(p.file ?? p.path ?? ''), fileName: String(p.name ?? '') }, null];
+  } },
+  add_custom_face_legacy: { service: 'Msg', method: 'addFavEmoji', arity: 1, build: (p) => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ emojiId: String(p.emoji_id ?? p.emoji ?? p.file_id ?? ''), isOrigin: 1 }];
+  } },
+  set_group_portrait: { service: 'Avatar', method: 'forceDownloadGroupPortrait', arity: 3, cbIndex: 2, build: (p) => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), { width: Number(p.width ?? 100), height: Number(p.height ?? 100) }, null];
+  } },
+  create_collection: { service: 'Collection', method: 'addCollection', arity: 1, build: (p) => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
 };
 
-// QQ 的原生方法不会抛错，失败原因写在返回值的某个文案字段里（FlashTransfer 放在 `errMs`，少一个 g）。
-// 只认文案不认数字码 —— `errCode 5` 是「这个群没有精华」这种状态，不是失败。
-const NATIVE_FAIL_RE = /(失败|错误|繁忙|超时|无权限|拒绝|不存在|没有权限|格式错误|not exist|failed|failure|error|\berr\b|invalid|denied|timeout|busy|param error)/i;
-// `clientWording` / `retMsg` 是 QQ 业务结果结构里的真实原因字段（见下面的 *Result 下钻）。
-const NATIVE_FAIL_KEYS = ['errMsg', 'errMs', 'msg', 'message', 'wording', 'clientWording', 'retMsg', 'errorMsg'];
+  // QQ 的原生方法不会抛错，失败原因写在返回值的某个文案字段里（FlashTransfer 放在 `errMs`，少一个 g）。
+  // 只认文案不认数字码 —— `errCode 5` 是「这个群没有精华」这种状态，不是失败。
+  const NATIVE_FAIL_RE = /(失败|错误|繁忙|超时|无权限|拒绝|不存在|没有权限|格式错误|not exist|failed|failure|error|\berr\b|invalid|denied|timeout|busy|param error)/i;
+  // `clientWording` / `retMsg` 是 QQ 业务结果结构里的真实原因字段（见下面的 *Result 下钻）。
+  const NATIVE_FAIL_KEYS = ['errMsg', 'errMs', 'msg', 'message', 'wording', 'clientWording', 'retMsg', 'errorMsg'];
+  // 不可撤回且影响他人的原生动作：默认只构造不发送，必须显式 confirm_danger。
+  // 判据是「发出去就撤不回来、也没有可读回的原值」——改备注、标记已读、点赞不在此列。
+  const IRREVERSIBLE = new Set([
+    'del_buddy',
+    'set_block',
+    'del_buddy_req',
+    'req_to_add_friends',
+    'invite_to_group',
+    'remove_group_essence',
+    'delete_group_bulletin',
+    'remove_group_tag',
+    'delete_flash_file',
+    'send_to_new_members',
+    'publish_group_bulletin',
+    'approval_friend_request',
+    'approval_doubt_buddy',
+  ]);
 
 function nativeRefusal(value, depth = 0) {
   if (!value || typeof value !== 'object' || depth > 2) return null;
@@ -322,6 +509,11 @@ function validateAction(request) {
     // 所以这里提前拦下，把「实际几个 / 应该几个」直接说清楚。
     if (Number.isSafeInteger(op.arity) && args.length !== op.arity) {
       throw fail(`${request.action} 需要 ${op.arity} 个原生参数，实际构造了 ${args.length} 个`, 1400);
+    }
+    // 不可撤回的动作默认只构造不发送：这些一旦发出去就撤不回来。
+    if (IRREVERSIBLE.has(request.action) && params.confirm_danger !== true) {
+      return { kind: 'native_dryrun', action: request.action, service: op.service, method: op.method, args,
+        note: '不可撤回的动作：默认只构造不发送。确认要真发时传 confirm_danger: true' };
     }
     return { kind: 'native_op', action: request.action, canonical: request.action, service: op.service, method: op.method, args, cbIndex: op.cbIndex };
   }
@@ -549,7 +741,14 @@ function createActionHandler(session, self, current, options = {}) {
     };
     try {
       return await Promise.race([cancelled, (async () => {
-        if (action.kind === 'native_op') {
+        if (action.kind === 'native_dryrun') {
+      // 只回报将要调用的方法和参数，不发 —— sent:false 就是没有副作用。
+      return { status: 'failed', retcode: 1404, data: {
+        action: action.action, service: action.service, method: action.method,
+        args: action.args, sent: false, note: action.note,
+      } };
+    }
+    if (action.kind === 'native_op') {
       const svc = serviceOf(action.service);
       if (!svc) return { status: 'failed', retcode: 1404, data: { service: action.service }, message: '找不到 service ' + action.service };
       const fn = svc[action.method];
