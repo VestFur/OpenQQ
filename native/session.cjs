@@ -2,6 +2,7 @@
 
 const nodePath = require('node:path');
 const nodeFs = require('node:fs');
+const Module = require('node:module');
 const { createEventReceiver } = require('./events.cjs');
 
 // actions.cjs 不被打包进 session.cjs，而是运行时 require：改完 dist/native/actions.cjs 后，
@@ -20,7 +21,15 @@ function loadActions() {
     if (full === __filename) continue;
     try { delete require.cache[require.resolve(full)]; } catch { /* 未载入或文件不存在，跳过 */ }
   }
-  return require(actionsPath);
+  // actions.cjs 本身不能走 require：实测清完 require.cache 再 require，拿到的仍是旧模块，
+  // 表现是重载看着成功、新加的 validateAction 分支却照样回「尚未支持动作」。
+  // 改读源码 + 用全新 Module 实例求值，不经过 require.cache，新增分支/新增表项必然生效。
+  const source = nodeFs.readFileSync(actionsPath, 'utf8');
+  const fresh = new Module(actionsPath, null);
+  fresh.filename = actionsPath;
+  fresh.paths = Module._nodeModulePaths(__dirname);
+  fresh._compile(source, actionsPath);
+  return fresh.exports;
 }
 
 // 只在 mtime 变了才重载；重载失败保留旧 handler，并留一条可查的日志（不静默吞掉）。
