@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(openqq_native LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -119,7 +119,10 @@ endif()
 # rel32 跳板的离线自检：wrapper.node 与我们 dll 可能相隔几十 GB，
 # 需要一块「离得够近」的空地写 `mov rax,imm64; jmp rax`。
 # 这段逻辑不能靠实机试 —— 试错的代价是一次 QQ 崩溃 + 一分钟重启。
-if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../test/trampoline-selftest.cpp")
+# 跳板自检验的是「wrapper.node 与我们的 DLL 相距约 29.6GB 时 rel32 还能不能跳」——
+# 那是 Windows 版的地址布局，而自研补丁本身也只实现在 Windows 引导器里，
+# 所以这个 target 只在 WIN32 下构建（Linux 引导器没有这条补丁，见 build-native.mjs 的说明）。
+if(BUILD_TESTING AND WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../test/trampoline-selftest.cpp")
   add_executable(openqq-trampoline ../test/trampoline-selftest.cpp)
   add_test(NAME trampoline COMMAND openqq-trampoline)
 endif()

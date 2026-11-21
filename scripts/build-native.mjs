@@ -90,13 +90,19 @@ if (debugVariant) {
     );
   }
   // 自研通道的交接入口必须在，否则所有 SSO 动作会静默回 1404。
-  if (!binary.includes(Buffer.from('__openqqSsoBodyConv', 'latin1'))) {
+  //
+  // 只对 Windows 强制要求：这条补丁改的是 wrapper.node 里某条 call 的 rel32，
+  // 偏移来自 Windows 版 wrapper.node 的逆向结论。Linux 的 wrapper.node 是另一个
+  // 二进制、偏移不同，那边的引导器（bootstrap_linux.cpp）还没做这一步 ——
+  // 因此 Linux 上 SSO 动作会如实回 1404，其余功能不受影响，不能让它把整个构建打挂。
+  const ssoWired = binary.includes(Buffer.from('__openqqSsoBodyConv', 'latin1'));
+  if (process.platform === 'win32' && !ssoWired) {
     throw new Error(
       '发布产物里没有 __openqqSsoBodyConv —— 自研 SSO 通道没编进去。\n'
       + '检查 bootstrap.cpp 的 installSsoSend() 里是否仍调用 ssoBodyConvInstall() 并注册该入口。',
     );
   }
-  console.log(`\n[release] ${artifact}  ${size} bytes（无探针符号，自研 SSO 通道就位）\n`);
+  console.log(`\n[release] ${artifact}  ${size} bytes（无探针符号${ssoWired ? '，自研 SSO 通道就位' : '；本平台未编入自研 SSO 通道'}）\n`);
 }
 
 // 顺带提醒：源码树里留着调试版是正常的，但别让它进发布目录。
