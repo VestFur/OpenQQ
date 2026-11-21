@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(openqq_native LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -37,16 +37,9 @@ if(WIN32)
   endif()
   add_executable(openqq-launch launch.cpp)
   add_library(openqq-bootstrap SHARED bootstrap.cpp)
-  # 自研 SSO 发送组件：随发行包分发，用户开箱即用。
-  # 只依赖 KERNEL32，被 bootstrap 按文件名 LoadLibraryW 进来后自建命名管道。
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sso-local/sso_local.cpp")
-    add_library(openqq-sso-local SHARED sso-local/sso_local.cpp)
-    set_target_properties(openqq-sso-local PROPERTIES
-      PREFIX "" OUTPUT_NAME "openqq-sso-local"
-      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
-      RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin")
-    target_link_libraries(openqq-sso-local PRIVATE kernel32)
-  endif()
+  # 这里曾经还有一个 openqq-sso-local 组件：它自建命名管道、把会话指针递进去再调 QQ 的发包原语。
+  # 那条路走到「只发不收」就断了（见 bootstrap.cpp 里 0x765d70 的六次实测记录），
+  # 现在发包改成「让 QQ 自己调、我们只接管 body」的补丁，不再需要任何独立组件，故删除。
   if(OPENQQ_ENABLE_PROBE)
     target_compile_definitions(openqq-bootstrap PRIVATE OPENQQ_ENABLE_PROBE=1)
   endif()
@@ -119,7 +112,10 @@ endif()
 # rel32 跳板的离线自检：wrapper.node 与我们 dll 可能相隔几十 GB，
 # 需要一块「离得够近」的空地写 `mov rax,imm64; jmp rax`。
 # 这段逻辑不能靠实机试 —— 试错的代价是一次 QQ 崩溃 + 一分钟重启。
-if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../test/trampoline-selftest.cpp")
+# 跳板自检验的是「wrapper.node 与我们的 DLL 相距约 29.6GB 时 rel32 还能不能跳」——
+# 那是 Windows 版的地址布局，而自研补丁本身也只实现在 Windows 引导器里，
+# 所以这个 target 只在 WIN32 下构建（Linux 引导器没有这条补丁，见 build-native.mjs 的说明）。
+if(BUILD_TESTING AND WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../test/trampoline-selftest.cpp")
   add_executable(openqq-trampoline ../test/trampoline-selftest.cpp)
   add_test(NAME trampoline COMMAND openqq-trampoline)
 endif()
