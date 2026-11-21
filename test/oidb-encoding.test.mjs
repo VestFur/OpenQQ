@@ -8,7 +8,6 @@ const require = createRequire(import.meta.url);
 const nativeDir = join(dirname(dirname(fileURLToPath(import.meta.url))), 'native');
 const pb = require(join(nativeDir, 'pb-mini.cjs'));
 const oidb = require(join(nativeDir, 'oidb-actions.cjs'));
-const ssoPipe = require(join(nativeDir, 'sso-pipe.cjs'));
 const actions = require(join(nativeDir, 'actions.cjs'));
 
 test('protobuf varints cover the boundaries and stay exact above 2^53', () => {
@@ -64,7 +63,7 @@ test('wrapOidbBase emits command/subCommand/errorCode/body and only adds reserve
 
 test('buildOidbPoke keeps the verified group shape', () => {
   assert.equal(
-    ssoPipe.buildOidbPoke({ groupId: 1041147387, userId: 2975434328 }).toString('hex'),
+    pb.buildOidbPoke({ groupId: 1041147387, userId: 2975434328 }).toString('hex'),
     '08d31d10011800221008d88ce68a0b10fbcbbaf00328003000'
   );
 });

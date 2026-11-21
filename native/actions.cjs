@@ -4,9 +4,10 @@ const { fail, identifier, integer, nativeId } = require('./common.cjs');
 const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
-// SSO over pipe：通过一个可选的外部注入组件（\\.\pipe\mojo.<pid>.control）发任意 SSO 包。
-// 没有这个组件时 sso_pipe_* 与走 OIDB 的动作会如实报「通道未就绪」，不影响其余动作。
-const ssoPipe = require('./sso-pipe.cjs');
+// SSO 发包走自研通道（bootstrap 在 QQ 进程内改了一次 std::string 构造的跳转目标），
+// 不加载任何第三方注入组件；没有配套 bootstrap 时 sso_pipe_* 与走 OIDB 的动作会如实报错，
+// 不影响其余动作。
+const pb = require('./pb-mini.cjs');
 // OIDB 动作表：一个动作一行，加动作只加一行。
 const oidb = require('./oidb-actions.cjs');
 
@@ -743,7 +744,7 @@ function validateAction(request) {
     return {
       kind: 'sso_pipe', action: 'send_poke',
       cmd: 'OidbSvcTrpcTcp.0xed3_1',
-      body: ssoPipe.buildOidbPoke({ groupId: g, userId: target }),
+      body: pb.buildOidbPoke({ groupId: g, userId: target }),
       wantReply: true, timeoutMs: 15000,
     };
   }
@@ -1011,6 +1012,95 @@ function createActionHandler(session, self, current, options = {}) {
     }
     return null;
   };
+
+  // ── 自研 SSO 发包（不依赖任何第三方注入组件）─────────────────────────
+  // bootstrap 在 QQ 进程内改了一次 std::string 构造的跳转目标（4 字节 + 12 字节跳板），
+  // 我们只负责把"这一次 body 用我的字节"告诉它（arm），然后调 QQ 自己的
+  // Msg.sendSsoCmdReqByContend —— 包由 QQ 自己发、回包也由 QQ 自己收，不碰任何内存扫描。
+  // 同一条命令在两个服务名前缀下可达性不同，空回包时换另一个前缀再试一次。
+  async function selfSsoSend(cmd, bodyBuf) {
+    const armFn = globalThis.__openqqSsoBodyConv;
+    if (typeof armFn !== 'function') {
+      return { ok: false, status: -1, note: '__openqqSsoBodyConv 不存在：需要新 bootstrap' };
+    }
+    const st = armFn('status', '');
+    if (!st || !st.patched) {
+      return { ok: false, status: -1, note: 'body 代劳补丁未安装（bootstrap 启动时应自动装；失败说明 wrapper.node 版本不符）' };
+    }
+    const bytes = Buffer.isBuffer(bodyBuf) ? bodyBuf : Buffer.from(bodyBuf || []);
+
+    const once = async (name) => {
+      const arm = armFn('arm', bytes.toString('hex'));
+      if (!arm || !arm.ok) return { ok: false, status: -1, note: 'arm 失败：' + JSON.stringify(arm || null) };
+      const t0 = Date.now();
+      let res;
+      try {
+        const svc = session.getMsgService();
+        // 占位串只用来触发转换，内容随后由 native 覆盖成真 body。
+        res = await Promise.resolve(svc.sendSsoCmdReqByContend(name, 'A'.repeat(bytes.length || 1)));
+      } catch (error) {
+        return { ok: false, status: -1, ms: Date.now() - t0,
+          note: 'sendSsoCmdReqByContend 抛错：' + String((error && error.message) || error).slice(0, 180) };
+      }
+      const ms = Date.now() - t0;
+
+      let resp = Buffer.alloc(0);
+      if (res instanceof Uint8Array) resp = Buffer.from(res);
+      else if (typeof res === 'string') resp = Buffer.from(res, 'latin1');
+      else if (res && typeof res === 'object') {
+        const raw = res.rsp ?? res.body ?? res.data;
+        if (raw instanceof Uint8Array) resp = Buffer.from(raw);
+        else if (typeof raw === 'string') resp = Buffer.from(raw, 'latin1');
+      }
+
+      // 解 OidbBase：1=command 2=subCommand 3=errorCode 4=body 5=errorMsg
+      const ob = {};
+      {
+        let i = 0;
+        const rv = () => { let v = 0n, s = 0n, c; do { if (i >= resp.length) throw new Error('eof'); c = resp[i++]; v |= BigInt(c & 0x7f) << s; s += 7n; } while (c & 0x80); return v; };
+        while (i < resp.length) {
+          let t; try { t = Number(rv()); } catch { break; }
+          const field = t >>> 3, wire = t & 7;
+          if (wire === 0) { try { ob[field] = Number(rv()); } catch { break; } }
+          else if (wire === 2) { const n = Number(rv()); ob[field] = resp.subarray(i, i + n); i += n; }
+          else if (wire === 5) i += 4;
+          else if (wire === 1) i += 8;
+          else break;
+        }
+      }
+      // ⚠️ proto3 省略零值：errorCode==0 时 field3 根本不存在，不能拿 -1 当失败。
+      // 另外 trpc 回包（群相册那类）没有 OidbBase 外壳，field3 可能是 bytes 而不是 varint ——
+      // 这时它不是错误码，按 0 处理，否则会把成功显示成 errorCode=[object Object]。
+      const errorCode = typeof ob[3] === 'number' ? ob[3] : 0;
+      return {
+        ok: errorCode === 0 && resp.length > 0,
+        status: errorCode,
+        errorCode,
+        // field4 在正常回包里是 bytes，但也见过是 varint 的（这时 ob[4] 是 Number）。
+        // 统一成 Buffer，否则下游 .subarray/.length 会抛（get_pskey 就因此报过
+        // `body.subarray is not a function`）。
+        body: Buffer.isBuffer(ob[4]) ? ob[4] : Buffer.alloc(0),
+        errorMsg: ob[5] ? Buffer.from(ob[5]).toString('utf8') : '',
+        response: resp,
+        ms,
+        cmdUsed: name,
+        note: resp.length ? '' : '空回包',
+      };
+    };
+
+    const first = await once(cmd);
+    // 有回包（哪怕是业务错误码）就用它 —— 那是服务端的真实答复。
+    if (first.response && first.response.length) return first;
+    // arm 都失败（补丁没装等）就没必要重试第二个前缀。
+    if (!first.ms && first.status === -1) return first;
+    const alt = altSsoCmdName(cmd);
+    if (!alt) return first;
+    const second = await once(alt);
+    if (second.response && second.response.length) {
+      return { ...second, fallbackFrom: cmd, note: '' };
+    }
+    return { ...first, note: '两个前缀都没回包（' + cmd + ' / ' + alt + '）' };
+  }
 
   function observe(name, args) {
     const records = name === 'onMsgInfoListUpdate' ? args[0] : name === 'onAddSendMsg' ? [args[0]] : [];
@@ -1399,7 +1489,7 @@ function createActionHandler(session, self, current, options = {}) {
       // Req 的 tail 是 field 1001（tag 0xCA 0x3E 两字节），不是 field 5 —— 从 SL 的
       // __write_BDHExpressionRoamReq 里 `buf[offset++] = 202; buf[offset++] = 62;` 读出来的。
       const bdhReq = Buffer.concat([pb.vint(1, 3), pb.vint(2, 1), pb.bytes(3, inner2), pb.vint(4, 9), pb.bytes(1001, tail)]);
-      const bdhRes = await ssoPipe.sendSso('ImgStore.BDHExpressionRoam', bdhReq, { wantReply: true, timeoutMs: 12000 });
+      const bdhRes = await selfSsoSend('ImgStore.BDHExpressionRoam', bdhReq);
       let token = null, bdhCode = null, bdhMsg = '';
       if (bdhRes && bdhRes.body && bdhRes.body.length) {
         const top = pbScan(bdhRes.body);
@@ -1416,7 +1506,7 @@ function createActionHandler(session, self, current, options = {}) {
       // ① HttpConn.0x6ff_501 —— 请求和响应**都是 field 1281**（实测通，1338 字节）。
       //    之前记成"请求是 field 1"是错的：`8a 50` 解 varint = 10250 = (1281<<3)|2。
       const httpConnReq = Buffer.from('8a501f0800100018102001300338013805380a38154802500958086205312e302e31', 'hex');
-      const hc = await ssoPipe.sendSso('HttpConn.0x6ff_501', httpConnReq, { wantReply: true, timeoutMs: 12000 });
+      const hc = await selfSsoSend('HttpConn.0x6ff_501', httpConnReq);
       const servers = [];
       let sigLen = 0, sessionKeyStr = '';
       if (hc && hc.body && hc.body.length) {
@@ -1493,14 +1583,18 @@ function createActionHandler(session, self, current, options = {}) {
       // 走 SnowLuma 组件的命名管道发 SSO 包（真发包口）。
       // 判据：回 status 0 + 有 body = 服务器真的回了；status 非 0 时 message 是服务端原文。
       if (action.action === 'sso_pipe_status') {
-        // ping 内部会按需建连接，所以这一个调用同时完成「探活 + 建连」。
-        // 之前只看 status.connected 会永远返回 false（那是纯读状态，不主动连）。
-        const ping = await ssoPipe.ping(3000);
-        const st = ssoPipe.status();
-        return { status: ping.ok ? 'ok' : 'failed', retcode: ping.ok ? 0 : 1500, data: { ...st, ping } };
+        // 探活 = 问一次补丁装没装、能不能 arm。装上了才算通道就绪。
+        const armFn = globalThis.__openqqSsoBodyConv;
+        const st = typeof armFn === 'function' ? (armFn('status', '') || {}) : { patched: false };
+        const ok = Boolean(st && st.patched);
+        return {
+          status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500,
+          data: { channel: 'self', patched: Boolean(st && st.patched), ...st },
+          ...(ok ? {} : { message: 'body 代劳补丁未安装：需要配套的 openqq-bootstrap（wrapper.node 版本不符时会装不上）' }),
+        };
       }
       try {
-        const r = await ssoPipe.sendSso(action.cmd, action.body, { wantReply: action.wantReply, timeoutMs: action.timeoutMs });
+        const r = await selfSsoSend(action.cmd, action.body);
         return {
           status: r.status === 0 ? 'ok' : 'failed',
           retcode: r.status === 0 ? 0 : 1500,
@@ -1509,14 +1603,14 @@ function createActionHandler(session, self, current, options = {}) {
             cmd: action.cmd,
             requestLen: action.body.length,
             status: r.status,
-            message: r.message,
-            responseLen: r.body.length,
-            responseHex: r.body.subarray(0, 65536).toString('hex'),
+            message: r.note || '',
+            responseLen: r.body ? r.body.length : 0,
+            responseHex: r.body ? r.body.subarray(0, 65536).toString('hex') : '',
           },
         };
       } catch (error) {
         return { status: 'failed', retcode: 1500,
-          data: { action: action.action, cmd: action.cmd, requestLen: action.body.length, pipe: ssoPipe.status() },
+          data: { action: action.action, cmd: action.cmd, requestLen: action.body.length, channel: 'self' },
           message: String(error && error.message ? error.message : error).slice(0, 300) };
       }
     }
@@ -2208,9 +2302,8 @@ function createActionHandler(session, self, current, options = {}) {
         // 走 SSO over pipe 发 OidbGetPskeyReq{domainList:["qzone.qq.com"]}，回包里 pskey 紧跟在域名后面：
         //   ... 0a 0c "qzone.qq.com" 12 <len> <pskey> ...
         try {
-          const r = await ssoPipe.sendSso('OidbSvcTrpcTcp.0x102a_0',
-            Buffer.from('08aa2010001800220e0a0c717a6f6e652e71712e636f6d', 'hex'),
-            { wantReply: true, timeoutMs: 8000 });
+          const r = await selfSsoSend('OidbSvcTrpcTcp.0x102a_0',
+            Buffer.from('08aa2010001800220e0a0c717a6f6e652e71712e636f6d', 'hex'));
           if (r && r.status === 0 && r.body && r.body.length) {
             const t = r.body.toString('latin1');
             const di = t.indexOf('qzone.qq.com');

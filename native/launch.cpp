@@ -310,7 +310,12 @@ public:
             require(InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attributeBytes), "initialize handle list");
             initialized = true;
             require(UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr), "set inherited handles");
-            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            // STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE：让 QQ 以「最小化且不激活」启动，
+            // 从源头避免抢前台焦点。之前只设 STARTF_USESTDHANDLES，QQ 用默认 SW_SHOWNORMAL
+            // 启动，窗口一出来就抢焦点、把用户的窗口挤到后台。
+            // 用 SW_SHOWMINNOACTIVE(7) 而不是 SW_SHOWMINIMIZED(2)：后者会激活窗口，照样抢。
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+            startup.StartupInfo.wShowWindow = SW_SHOWMINNOACTIVE;
             startup.StartupInfo.hStdInput = inherited[0];
             startup.StartupInfo.hStdOutput = inherited[1];
             startup.StartupInfo.hStdError = inherited[2];
