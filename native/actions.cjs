@@ -5,6 +5,158 @@ const { parseCQ } = require('./cq.cjs');
 const admin = require('./admin.cjs');
 const { createElementBuilder } = require('./elements.cjs');
 
+// 原生方法直调表（一期只收只读动作）：动作名 → service 名 + 方法名 + 参数个数。
+// 加一个动作只加一行。写入类动作单独分期，避免一次 PR 里混着有副作用的路径。
+const NATIVE_OPS = {
+  get_profile_like: { service: 'ProfileLike', method: 'getBuddyProfileLike', arity: 1, build: p => [Number(p.user_id)] },
+  get_online_clients: { service: 'OnlineStatus', method: 'getOnlineFrdStatusInfos', arity: 0, build: () => [] },
+  get_recent_contact: { service: 'RecentContact', method: 'getRecentContactList', arity: 0, build: () => [] },
+  get_group_tags: { service: 'Group', method: 'getGroupTagRecords', arity: 1, build: p => [String(p.group_id ?? '')] },
+  list_filesets: { service: 'FlashTransfer', method: 'getFileSetList', arity: 1, build: p => [{ pageCount: Number(p.count ?? 20), pageIndex: Number(p.index ?? 0) }] },
+  get_clientkey: { service: 'Ticket', method: 'forceFetchClientKey', arity: 1, build: p => [String(p.cmd ?? '')] },
+  get_msg_emoji_likes: { service: 'msg', method: 'getMsgEmojiLikesList', arity: 7, build: p => {
+    const peer = (p.openqq_ref && typeof p.openqq_ref === 'object' && p.openqq_ref.peerUid)
+      ? { chatType: Number(p.openqq_ref.chatType ?? 2), peerUid: String(p.openqq_ref.peerUid), guildId: String(p.openqq_ref.guildId ?? '') }
+      : { chatType: p.group_id ? 2 : 1, peerUid: String(p.group_id ?? p.user_id ?? ''), guildId: '' };
+    return [peer, String(p.msg_id ?? p.message_id ?? ''), String(p.emoji_id ?? ''), Number(p.count ?? 20), String(p.cookie ?? ''), 0, false];
+  } },
+  fetch_emoji_like: { service: 'msg', method: 'getMsgEmojiLikesList', arity: 7, build: p => {
+    const peer = (p.openqq_ref && typeof p.openqq_ref === 'object' && p.openqq_ref.peerUid)
+      ? { chatType: Number(p.openqq_ref.chatType ?? 2), peerUid: String(p.openqq_ref.peerUid), guildId: String(p.openqq_ref.guildId ?? '') }
+      : { chatType: p.group_id ? 2 : 1, peerUid: String(p.group_id ?? p.user_id ?? ''), guildId: '' };
+    return [peer, String(p.msg_id ?? p.message_id ?? ''), String(p.emoji_id ?? ''), Number(p.count ?? 20), String(p.cookie ?? ''), 0, false];
+  } },
+  get_ai_record: { service: 'Group', method: 'listAllAIVoice', arity: 1, build: p => [{ groupCode: String(p.group_id ?? '') }] },
+  get_recent_emoji: { service: 'msg', method: 'getRecentUseEmojiList', arity: 0, build: () => [] },
+  fetch_group_essence_list: { service: 'Group', method: 'getGroupLatestEssenceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  fetch_group_essence_list_legacy: { service: 'Group', method: 'getGroupLatestEssenceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  query_cached_essence: { service: 'Group', method: 'queryCachedEssenceMsg', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_group_bulletin_list: { service: 'Group', method: 'getGroupBulletinList', arity: 4, cbIndex: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, Number(p.page ?? 0), Number(p.count ?? 20), {}];
+  } },
+  get_group_bulletin_read_users: { service: 'Group', method: 'getGroupBulletinReadUsers', arity: 6, cbIndex: 5, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), Number(p.page ?? 0), Number(p.count ?? 20), '', null];
+  } },
+  get_group_tag_list: { service: 'Group', method: 'getGroupTagListByCategory', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? '') }];
+  } },
+  list_ai_voice: { service: 'Group', method: 'listAllAIVoice', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? '') }];
+  } },
+  get_group_member_level_info: { service: 'Group', method: 'getGroupMemberLevelInfo', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? '') }];
+  } },
+  get_group_shutup_list: { service: 'Group', method: 'queryGroupMuteMemberList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_group_shutup_list_legacy: { service: 'Group', method: 'queryGroupMuteMemberList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_transferable_group_list: { service: 'Group', method: 'getTransferableGroupList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_buddy_req: { service: 'Buddy', method: 'getBuddyReq', arity: 0, build: () => [] },
+  get_like_list: { service: 'OnlineStatus', method: 'getLikeList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Number(p.count ?? 20)];
+  } },
+  get_group_file_list: { service: 'RichMedia', method: 'getGroupFileList', arity: 2, cbIndex: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, null];
+  } },
+  get_concern_weather: { service: 'NodeMisc', method: 'getConcernWeather', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_cities_weather: { service: 'NodeMisc', method: 'getCommonlyUsedCitiesWeather', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_bottom_emoji_table: { service: 'msg', method: 'getRecentUsedFaceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_bottom_emoji_table_legacy: { service: 'msg', method: 'getRecentUsedFaceList', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{}];
+  } },
+  get_keyword_emoji: { service: 'msg', method: 'fetchGetHitEmotionsByWord', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    // 实测：参数必须是对象且带 word 字段（传字符串会回 words:"" 并返回全量，传 {word:'哈哈'} 才按词命中）
+    return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
+  } },
+  get_keyword_emoji_legacy: { service: 'msg', method: 'fetchGetHitEmotionsByWord', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
+  } },
+  fetch_group_notify: { service: 'Group', method: 'fetchGroupNotify', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
+  } },
+  get_group_notifies_unread: { service: 'Group', method: 'getGroupNotifiesUnreadCount', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_single_screen_notifies: { service: 'Group', method: 'getSingleScreenNotifies', arity: 3, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? '')];
+  } },
+  get_single_screen_notifies_v2: { service: 'Group', method: 'getSingleScreenNotifiesV2', arity: 4, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? ''), Number(p.filter ?? 0)];
+  } },
+  get_group_invite_limit: { service: 'Group', method: 'getGroupInviteNoAuthLimitNum', arity: 1, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.group_id ?? '')];
+  } },
+  get_buddy_req_unread: { service: 'Buddy', method: 'getBuddyReqUnreadCnt', arity: 0, build: () => [] },
+  get_add_friend_blocked_list: { service: 'Buddy', method: 'getAddFriendBlockedList', arity: 2, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [Number(p.page ?? 0), Number(p.count ?? 20)];
+  } },
+  search_sys_faces: { service: 'Msg', method: 'fetchMarketEmoticonFaceImages', arity: 1, cbIndex: 0, build: p => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    return [String(p.keyword ?? p.word ?? '')];
+  } },
+  nc_get_user_status: { service: 'Profile', method: 'getStatus', arity: 2, cbIndex: 1, build: (p) => {
+    if (Array.isArray(p.raw_args)) return p.raw_args;
+    const id = String(p.uid ?? p.user_id ?? p.uin ?? '');
+    return [{ uids: [id] }, null];
+  } },
+  nc_get_packet_status: { service: 'MSF', method: 'getMsfStatus', arity: 0, build: () => [] },
+};
+
+function nativeRefusal(value, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 2) return null;
+  for (const key of NATIVE_FAIL_KEYS) {
+    const text = value[key];
+    if (typeof text === 'string' && text.trim() && NATIVE_FAIL_RE.test(text)) return text.trim().slice(0, 200);
+  }
+  // 只下钻这几个已知的包裹层（FlashTransfer 把结果放在 rsp 里），不扫整棵对象以免误伤。
+  for (const key of ['rsp', 'value', 'data', 'info']) {
+    const nested = nativeRefusal(value[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
 // SSO 命令表：一个动作一行，加动作只加一行。
 const oidb = require('./oidb-actions.cjs');
 
@@ -173,6 +325,25 @@ function validateAction(request) {
     }
     return { kind: 'sso_pipe', action: request.action, cmd: act.wire, body };
   }
+  if (NATIVE_OPS[request.action]) {
+    const op = NATIVE_OPS[request.action];
+    let args;
+    try { args = op.build(params); }
+    catch (error) { throw fail(`${request.action} 参数无效: ${error && error.message ? error.message : error}`, 1400); }
+    if (!Array.isArray(args)) throw fail(`${request.action} 的参数构造没有返回数组`, 1400);
+    // arity 是实测的原生 argc。个数不对时 C++ 只在日志里断言、OneBot 侧只看到一个没头没尾的 1500，
+    // 所以这里提前拦下，把「实际几个 / 应该几个」直接说清楚。
+    if (Number.isSafeInteger(op.arity) && args.length !== op.arity) {
+      throw fail(`${request.action} 需要 ${op.arity} 个原生参数，实际构造了 ${args.length} 个`, 1400);
+    }
+    return { kind: 'native_op', action: request.action, canonical: request.action, service: op.service, method: op.method, args, cbIndex: op.cbIndex };
+  }
+  if (request.action === 'native_call') {
+    const method = String(params.method ?? '');
+    if (!/^[A-Za-z][A-Za-z0-9_]{1,60}$/.test(method)) throw fail('native_call 需要 method', 1400);
+    return { kind: 'native_op', action: 'native_call', service: String(params.service ?? 'msg'), method,
+      args: Array.isArray(params.args) ? params.args.slice(0, 12) : [] };
+  }
   if (!sendActions.includes(request.action)) throw fail('尚未支持动作: ' + request.action, 1404);
   let type = request.action === 'send_private_msg' ? 'private' : request.action === 'send_group_msg' ? 'group' : params.message_type;
   if (!type) {
@@ -195,6 +366,25 @@ function createActionHandler(session, self, current, options = {}) {
   // 我们只负责告诉它"这一次 body 用我的字节"（arm），然后调 QQ 自己的
   // Msg.sendSsoCmdReqByContend —— 包由 QQ 发、回包也由 QQ 收，不做任何内存扫描。
   // 同一条命令在两个服务名前缀下可达性不同（有的会静默丢包），空回包时换另一个前缀再试一次。
+  const namesOf = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return [];
+    const set = new Set();
+    for (let o = value; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      for (const n of Object.getOwnPropertyNames(o)) if (n !== 'constructor') set.add(n);
+    }
+    return Array.from(set).sort();
+  };
+  const serviceOf = name => {
+    const key = String(name ?? '');
+    if (!/^[A-Za-z][A-Za-z0-9]{0,40}$/.test(key)) return null;
+    const camel = key.charAt(0).toUpperCase() + key.slice(1);
+    for (const getter of ['get' + camel + 'Service', 'get' + camel, key]) {
+      if (typeof session[getter] !== 'function') continue;
+      try { const svc = session[getter](); if (svc) return svc; } catch { /* 换下一个名字 */ }
+    }
+    return null;
+  };
+
   async function selfSsoSend(cmd, bodyBuf) {
     const armFn = globalThis.__openqqSsoBodyConv;
     if (typeof armFn !== 'function') {
@@ -345,7 +535,41 @@ function createActionHandler(session, self, current, options = {}) {
     };
     try {
       return await Promise.race([cancelled, (async () => {
-        if (action.kind === 'oidb_dryrun') {
+        if (action.kind === 'native_op') {
+      const svc = serviceOf(action.service);
+      if (!svc) return { status: 'failed', retcode: 1404, data: { service: action.service }, message: '找不到 service ' + action.service };
+      const fn = svc[action.method];
+      if (typeof fn !== 'function') return { status: 'failed', retcode: 1404, data: { service: action.service, method: action.method }, message: 'service 上没有这个方法' };
+      // 回调桥：内核里有一批方法（精华列表 / 群公告列表 / 群文件列表…）不 return，结果只从最后一个
+      // 参数建成的回调里给出。IPC 传过来的 args 已经被 JSON 序列化过，函数在那种表示里活不下来，
+      // 所以回调位置在**执行侧**注入（cbIndex 指向第几个参数），并把回调实参当作返回值上报。
+      const callArgs = Array.isArray(action.args) ? action.args.slice() : [];
+      const cbIndex = Number.isSafeInteger(action.cbIndex) ? action.cbIndex : -1;
+      let cbValue; let cbCalled = false;
+      if (cbIndex >= 0 && cbIndex < callArgs.length) {
+        callArgs[cbIndex] = (...cbArgs) => { cbCalled = true; cbValue = cbArgs.length <= 1 ? cbArgs[0] : cbArgs; };
+      }
+      try {
+        // 有些方法既不 return 也不回调（参数形状不对时内核会把调用吞掉），
+        // 不设上限就会把这一次动作永久挂住，所以给一个有回调的等久一点、没回调的等短一点。
+        const waitMs = cbIndex >= 0 ? 12000 : 6000;
+        const value = await Promise.race([
+          Promise.resolve(fn.apply(svc, callArgs)),
+          new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('原生调用超时：该方法既没有同步返回也没有触发回调')), waitMs); if (t.unref) t.unref(); }),
+        ]);
+        const effective = (value === undefined || value === null) && cbCalled ? cbValue : value;
+        let out = effective;
+        try { out = JSON.parse(JSON.stringify(effective === undefined ? null : effective)); } catch { out = String(effective); }
+        const nativeData = { action: action.action, service: action.service, method: action.method, argc: callArgs.length, via: cbCalled && (value === undefined || value === null) ? 'callback' : 'return', value: out };
+        const refusal = nativeRefusal(out);
+        if (refusal) return { status: 'failed', retcode: 1500, data: nativeData, message: 'QQ 拒绝' + action.action + '：' + refusal };
+        return { status: 'ok', retcode: 0, data: nativeData };
+      } catch (error) {
+        return { status: 'failed', retcode: 1500, data: { action: action.action, service: action.service, method: action.method, argc: callArgs.length, cbCalled },
+          message: String(error && error.message ? error.message : error).slice(0, 300) };
+      }
+    }
+    if (action.kind === 'oidb_dryrun') {
       // 只回报将要发送的字节，不发 —— 调用方看 sent:false 就知道没有副作用。
       return { status: 'failed', retcode: 1404, data: {
         action: action.action, cmd: action.cmd, bodyHex: action.bodyHex,
