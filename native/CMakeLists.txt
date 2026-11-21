@@ -37,16 +37,9 @@ if(WIN32)
   endif()
   add_executable(openqq-launch launch.cpp)
   add_library(openqq-bootstrap SHARED bootstrap.cpp)
-  # 自研 SSO 发送组件：随发行包分发，用户开箱即用。
-  # 只依赖 KERNEL32，被 bootstrap 按文件名 LoadLibraryW 进来后自建命名管道。
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sso-local/sso_local.cpp")
-    add_library(openqq-sso-local SHARED sso-local/sso_local.cpp)
-    set_target_properties(openqq-sso-local PROPERTIES
-      PREFIX "" OUTPUT_NAME "openqq-sso-local"
-      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
-      RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin")
-    target_link_libraries(openqq-sso-local PRIVATE kernel32)
-  endif()
+  # 这里曾经还有一个 openqq-sso-local 组件：它自建命名管道、把会话指针递进去再调 QQ 的发包原语。
+  # 那条路走到「只发不收」就断了（见 bootstrap.cpp 里 0x765d70 的六次实测记录），
+  # 现在发包改成「让 QQ 自己调、我们只接管 body」的补丁，不再需要任何独立组件，故删除。
   if(OPENQQ_ENABLE_PROBE)
     target_compile_definitions(openqq-bootstrap PRIVATE OPENQQ_ENABLE_PROBE=1)
   endif()
