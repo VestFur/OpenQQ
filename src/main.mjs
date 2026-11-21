@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, renameSync, readFileSync, createWriteStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +22,23 @@ import { createAIClient } from './bot/ai.mjs';
 import { createImageClient } from './bot/image.mjs';
 import { createBotEngine } from './bot/engine.mjs';
 import { createBotApi } from './bot/api.mjs';
+
+// 运行中的 QQ 里有没有我们的原生模块。QQ 允许多开、各账号分区独立，所以机器上同时开着
+// 别的账号的 QQ 是正常情况——那不是"附着失败"，而是"该另起一个实例"。
+// 查不出来时按"是我们的"处理，保持原来更保守的行为。
+function runningQQIsOurs() {
+  if (process.platform !== 'win32') return true;
+  try {
+    const ps = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const out = execFileSync(ps, [
+      '-NoProfile', '-NonInteractive', '-Command',
+      "Get-Process QQ -ErrorAction SilentlyContinue | ForEach-Object { try { if ($_.Modules | Where-Object { $_.ModuleName -like '*openqq-bootstrap*' }) { 'openqq' } } catch {} }",
+    ], { encoding: 'utf8', windowsHide: true, timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return String(out).includes('openqq');
+  } catch {
+    return true;
+  }
+}
 
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimeDir = join(projectDir, '.runtime');
@@ -113,10 +130,17 @@ async function start(qq, config, existingWebUI) {
       });
     });
     if (!attached) {
-      await channel.close();
-      throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+      // 附着不上有两种完全不同的原因，不能一律报"请先退出 QQ"：
+      //  · 运行中的 QQ 里装着我们的原生模块 → 那是同一个实例但端点没连回来（真异常）。
+      //  · 运行中的 QQ 是另一个账号（QQ 允许多开，各账号分区独立）→ 它根本不是我们的目标，
+      //    另起一个实例才是对的。多账号机器上很常见，不该要求用户把自己的 QQ 关掉。
+      if (runningQQIsOurs()) {
+        await channel.close();
+        throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+      }
+      out.log('info', '运行中的 QQ 不是 OpenQQ 注入的实例（另一个账号），将以独立实例启动');
     }
-    out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
+    if (attached) out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
   }
   let network;
   // message_id values survive a restart: the mapping to QQ's own ids is kept in .runtime/ids.json.
