@@ -336,14 +336,15 @@ function createActionHandler(session, self, current, options = {}) {
       // 判据：status 0 + 有 body = 服务端真回了；status 非 0 时 note 是服务端原文。
       if (action.action === 'sso_pipe_status') {
         // 探活 = 问一次补丁装没装。装上了才算通道就绪。
+        // ⚠️ 这里必须「成功返回纯数据、失败 throw」：native/session.cjs 会把正常返回值统一包进
+        // { status:'ok', retcode:0, data }。直接返回 { status:'failed', retcode:1500 } 会被二次包裹成
+        // retcode 0，调用方看到的永远是成功。和下面的 sso_pipe_send 保持同一约定。
         const armFn = globalThis.__openqqSsoBodyConv;
         const st = typeof armFn === 'function' ? (armFn('status', '') || {}) : { patched: false };
-        const ok = Boolean(st && st.patched);
-        return {
-          status: ok ? 'ok' : 'failed', retcode: ok ? 0 : 1500,
-          data: { channel: 'self', patched: Boolean(st && st.patched), ...st },
-          ...(ok ? {} : { message: 'body 代劳补丁未安装：需要配套的 openqq-bootstrap（wrapper.node 版本不符时会装不上）' }),
-        };
+        if (!st || !st.patched) {
+          throw fail('body 代劳补丁未安装：需要配套的 openqq-bootstrap（wrapper.node 版本不符时会装不上）', 1500);
+        }
+        return { channel: 'self', patched: true, ...st };
       }
       // 失败用 throw 表达：调用方那一层（session.cjs）只在 reject 时才写 retcode，
       // 返回 {status:'failed'} 会被当成成功包进 data 里，调用方看不出错。
