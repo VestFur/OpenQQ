@@ -29,115 +29,88 @@ const NATIVE_OPS = {
   get_ai_record: { service: 'Group', method: 'listAllAIVoice', arity: 1, build: p => [{ groupCode: String(p.group_id ?? '') }] },
   get_recent_emoji: { service: 'msg', method: 'getRecentUseEmojiList', arity: 0, build: () => [] },
   fetch_group_essence_list: { service: 'Group', method: 'getGroupLatestEssenceList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   fetch_group_essence_list_legacy: { service: 'Group', method: 'getGroupLatestEssenceList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   query_cached_essence: { service: 'Group', method: 'queryCachedEssenceMsg', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   get_group_bulletin_list: { service: 'Group', method: 'getGroupBulletinList', arity: 4, cbIndex: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, Number(p.page ?? 0), Number(p.count ?? 20), {}];
+        return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, Number(p.page ?? 0), Number(p.count ?? 20), {}];
   } },
   get_group_bulletin_read_users: { service: 'Group', method: 'getGroupBulletinReadUsers', arity: 6, cbIndex: 5, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), Number(p.page ?? 0), Number(p.count ?? 20), '', null];
+        return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), Number(p.page ?? 0), Number(p.count ?? 20), '', null];
   } },
   get_group_tag_list: { service: 'Group', method: 'getGroupTagListByCategory', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? '') }];
+        return [{ groupCode: String(p.group_id ?? '') }];
   } },
   list_ai_voice: { service: 'Group', method: 'listAllAIVoice', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? '') }];
+        return [{ groupCode: String(p.group_id ?? '') }];
   } },
   get_group_member_level_info: { service: 'Group', method: 'getGroupMemberLevelInfo', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? '') }];
+        return [{ groupCode: String(p.group_id ?? '') }];
   } },
   get_group_shutup_list: { service: 'Group', method: 'queryGroupMuteMemberList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   get_group_shutup_list_legacy: { service: 'Group', method: 'queryGroupMuteMemberList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   get_transferable_group_list: { service: 'Group', method: 'getTransferableGroupList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   get_buddy_req: { service: 'Buddy', method: 'getBuddyReq', arity: 0, build: () => [] },
   get_like_list: { service: 'OnlineStatus', method: 'getLikeList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [Number(p.count ?? 20)];
+        return [Number(p.count ?? 20)];
   } },
   get_group_file_list: { service: 'RichMedia', method: 'getGroupFileList', arity: 2, cbIndex: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, null];
+        return [{ groupCode: String(p.group_id ?? ''), pageStart: Number(p.page ?? 0), pageLimit: Number(p.count ?? 20) }, null];
   } },
   get_concern_weather: { service: 'NodeMisc', method: 'getConcernWeather', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{}];
+        return [{}];
   } },
   get_cities_weather: { service: 'NodeMisc', method: 'getCommonlyUsedCitiesWeather', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{}];
+        return [{}];
   } },
   get_bottom_emoji_table: { service: 'msg', method: 'getRecentUsedFaceList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{}];
+        return [{}];
   } },
   get_bottom_emoji_table_legacy: { service: 'msg', method: 'getRecentUsedFaceList', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{}];
+        return [{}];
   } },
   get_keyword_emoji: { service: 'msg', method: 'fetchGetHitEmotionsByWord', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    // 实测：参数必须是对象且带 word 字段（传字符串会回 words:"" 并返回全量，传 {word:'哈哈'} 才按词命中）
+        // 实测：参数必须是对象且带 word 字段（传字符串会回 words:"" 并返回全量，传 {word:'哈哈'} 才按词命中）
     return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
   } },
   get_keyword_emoji_legacy: { service: 'msg', method: 'fetchGetHitEmotionsByWord', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
+        return [{ word: String(p.word ?? p.keyword ?? p.text ?? '') }];
   } },
   fetch_group_notify: { service: 'Group', method: 'fetchGroupNotify', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
+        return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
   } },
   get_group_notifies_unread: { service: 'Group', method: 'getGroupNotifiesUnreadCount', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   get_single_screen_notifies: { service: 'Group', method: 'getSingleScreenNotifies', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? '')];
+        return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? '')];
   } },
   get_single_screen_notifies_v2: { service: 'Group', method: 'getSingleScreenNotifiesV2', arity: 4, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? ''), Number(p.filter ?? 0)];
+        return [Boolean(p.doubt ?? false), Number(p.count ?? 20), String(p.cookie ?? ''), Number(p.filter ?? 0)];
   } },
   get_group_invite_limit: { service: 'Group', method: 'getGroupInviteNoAuthLimitNum', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? '')];
+        return [String(p.group_id ?? '')];
   } },
   get_buddy_req_unread: { service: 'Buddy', method: 'getBuddyReqUnreadCnt', arity: 0, build: () => [] },
   get_add_friend_blocked_list: { service: 'Buddy', method: 'getAddFriendBlockedList', arity: 2, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [Number(p.page ?? 0), Number(p.count ?? 20)];
+        return [Number(p.page ?? 0), Number(p.count ?? 20)];
   } },
   search_sys_faces: { service: 'Msg', method: 'fetchMarketEmoticonFaceImages', arity: 1, cbIndex: 0, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.keyword ?? p.word ?? '')];
+        return [String(p.keyword ?? p.word ?? '')];
   } },
   nc_get_user_status: { service: 'Profile', method: 'getStatus', arity: 2, cbIndex: 1, build: (p) => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    const id = String(p.uid ?? p.user_id ?? p.uin ?? '');
+        const id = String(p.uid ?? p.user_id ?? p.uin ?? '');
     return [{ uids: [id] }, null];
   } },
   nc_get_packet_status: { service: 'MSF', method: 'getMsfStatus', arity: 0, build: () => [] },
@@ -352,12 +325,9 @@ function validateAction(request) {
     }
     return { kind: 'native_op', action: request.action, canonical: request.action, service: op.service, method: op.method, args, cbIndex: op.cbIndex };
   }
-  if (request.action === 'native_call') {
-    const method = String(params.method ?? '');
-    if (!/^[A-Za-z][A-Za-z0-9_]{1,60}$/.test(method)) throw fail('native_call 需要 method', 1400);
-    return { kind: 'native_op', action: 'native_call', service: String(params.service ?? 'msg'), method,
-      args: Array.isArray(params.args) ? params.args.slice(0, 12) : [] };
-  }
+  // native_call（按任意 service/method 反射调用内核）已按 review 移除：
+  // 它绕过所有白名单与危险守卫，只读 PR 不应携带这种入口。
+  // 本地调试需要它时用 wip 分支（那里保留了全套调试入口）。
   if (!sendActions.includes(request.action)) throw fail('尚未支持动作: ' + request.action, 1404);
   let type = request.action === 'send_private_msg' ? 'private' : request.action === 'send_group_msg' ? 'group' : params.message_type;
   if (!type) {
