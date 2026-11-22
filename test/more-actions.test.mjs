@@ -138,7 +138,9 @@ test('message ids survive a restart: the same message keeps its id, old ids stil
   assert.equal(JSON.parse(await readFile(path, 'utf8')).nextId, 4);
 
   const second = createEventConverter({ idStore: createIdStore(path) });
-  assert.deepEqual(second.resolve(a), { kind: 'message', selfId: 123456, chatType: 2, peerUid: '987654', msgId: '7001' });
+  // msgSeq 现在跟着 ref 一起存（forwardMsg 的 msgInfos 要 msgId+msgSeq 成对）：
+  // 这些 fixture 消息没带 msgSeq，存进 ref 的就是空串。
+  assert.deepEqual(second.resolve(a), { kind: 'message', selfId: 123456, chatType: 2, peerUid: '987654', msgId: '7001', msgSeq: '' });
   assert.equal(second.resolve(privateId).peerUid, 'u_friend');
   assert.equal(second.messageId(self, message('7002')), b, 'a message seen before keeps its id');
   assert.equal(second.messageId(self, message('7003')), 4, 'new messages continue the sequence');

@@ -447,5 +447,19 @@ export function createMediaPreparer({ dir, allowPrivate = process.env.OPENQQ_MED
         try { if (Date.now() - (await stat(path)).mtimeMs > olderThanMs) await rm(path, { force: true }); } catch { /* ignore */ }
       }
     },
+    // The OneBot download_file action, served from the main process so the payload never
+    // crosses the 1 MiB IPC frame and the fetch never blocks QQ's event loop. Reuses
+    // resolveSource, which carries the full SSRF protection: DNS answers are checked
+    // against the block list, literal private addresses are refused, redirects are
+    // bounded, and the body is streamed against the size limit.
+    async downloadFile(params) {
+      if (!params || typeof params !== 'object') throw fail('download_file 参数必须是对象');
+      const url = typeof params.url === 'string' ? params.url.trim() : '';
+      const b64 = typeof params.base64 === 'string' ? params.base64.trim() : '';
+      if (!url && !b64) throw fail('download_file 需要 url 或 base64', 1400);
+      const source = await resolveSource(url || ('base64://' + b64), 'file', () => {});
+      const size = await sizeChecked(source.path, 'file');
+      return { file: source.path, name: safeName(params.name ?? source.name, 'file'), size };
+    },
   };
 }

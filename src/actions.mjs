@@ -77,7 +77,7 @@ function resolveReferences(converter, request) {
   if (request.action === 'forward_friend_single_msg' || request.action === 'forward_group_single_msg') {
     const ref = converter.resolve(params.message_id);
     if (ref?.kind !== 'message') throw fail('message_id 不存在或已过期（仅支持本次运行期间收到的消息）', 1404);
-    return { ...request, params: { ...params, openqq_ref: { chatType: ref.chatType, peerUid: ref.peerUid, msgId: ref.msgId } } };
+    return { ...request, params: { ...params, openqq_ref: { chatType: ref.chatType, peerUid: ref.peerUid, msgId: ref.msgId, msgSeq: ref.msgSeq ?? '' } } };
   }
   if (!sendActions.includes(request.action) || !Array.isArray(params.message)) return request;
   const message = params.message.map(segment => {
@@ -114,6 +114,14 @@ export async function dispatchAction(channel, converter, request, options = {}) 
       // Only OpenQQ's own temporary media is cleaned, and only what an earlier run left behind (the same rule as at startup).
       await options.media?.sweep();
       response = { status: 'ok', retcode: 0, data: null };
+    } else if (request?.action === 'download_file') {
+      // Runs in the main process on purpose: a base64 payload bigger than ~750 KiB would
+      // not even fit through the 1 MiB IPC frame, and a synchronous write inside QQ
+      // blocks its event loop. media.mjs carries the full SSRF protection (DNS-level
+      // block list, bounded redirects, streamed size limit).
+      if (typeof options.media?.downloadFile !== 'function') throw new Error('当前会话不支持 download_file');
+      const data = await options.media.downloadFile(request.params ?? {});
+      response = { status: 'ok', retcode: 0, data };
     } else {
       let prepared = resolveReferences(converter, nativeActions.normalizeParams(request));
       if (options.media && sendActions.includes(prepared?.action) && prepared.params && typeof prepared.params === 'object') {

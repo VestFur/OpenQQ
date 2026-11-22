@@ -42,7 +42,10 @@ export function createEventConverter({ mediaUrl, idStore } = {}) {
     return ids.get(key);
   }
   const messageRef = (selfId, message, nativeId = message.msgId) => messageId(keyOf(selfId, message, nativeId),
-    { kind: 'message', selfId, chatType: message.chatType, peerUid: String(message.peerUid), msgId: String(nativeId) });
+    { kind: 'message', selfId, chatType: message.chatType, peerUid: String(message.peerUid), msgId: String(nativeId),
+      // forwardMsg 的 msgInfos 要「消息 ID + 序号」成对出现：只填 msgId 时内核按记录找不到配对条目。
+      // 收到的原生消息自带 msgSeq，存进 ref 一起带下去（老记录没有就保持空串）。
+      msgSeq: String(message.msgSeq ?? '') });
   function forwardId(selfId, ref) {
     if (![ref?.root, ref?.parent].every(value => /^\d+$/.test(String(value)))) throw new Error('合并转发标识无效');
     return messageId(['forward', selfId, ref.chatType, ref.peerUid, ref.root, ref.parent].join(':'),

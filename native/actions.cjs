@@ -24,116 +24,9 @@ function nativePeerOf(params) {
   throw new Error('需要 group_id 或 user_id（或 openqq_ref.peerUid）');
 }
 
-// download_file 只接受公网 http(s)。允许任意 URL 会让这个动作变成 SSRF 跳板：打到内网、
-// 127.0.0.1、链路本地地址，或者云环境的元数据地址（169.254.169.254）。
-const PRIVATE_V4 = [
-  [/^0\./, '0.0.0.0/8'],
-  [/^10\./, '10.0.0.0/8'],
-  [/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, '100.64.0.0/10'],
-  [/^127\./, '127.0.0.0/8'],
-  [/^169\.254\./, '169.254.0.0/16'],
-  [/^172\.(1[6-9]|2\d|3[01])\./, '172.16.0.0/12'],
-  [/^192\.168\./, '192.168.0.0/16'],
-];
-const PRIVATE_V6 = [/^::$/, /^::1$/, /^f[cd]/, /^fe[89ab]/, /^::ffff:/];
-
-// 字面检查只能挡住「url 里直接写着内网 IP」的情况。挡不住的是「域名解析到内网」——
-// `127.0.0.1.nip.io` 这种公共泛解析域名、或者任何人自己域名下的一条 A 记录，都能绕过它。
-// 所以分两层：
-//   · 这一层是同步的字面检查，validateAction 阶段就能拒掉最明显的一批（连 DNS 都不用问）；
-//   · 真正的 DNS 判定在 assertHostResolves()，由执行侧在发请求前 await（那里才允许异步）。
-function assertPublicHttpUrl(raw) {
-  let url;
-  try { url = new URL(String(raw)); } catch { throw fail('download_file 的 url 不是合法地址'); }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw fail('download_file 只支持 http/https');
-  if (url.username || url.password) throw fail('download_file 不接受带账号密码的 url');
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (!host) throw fail('download_file 的 url 没有主机名');
-  if (/^(localhost|.*\.(localhost|localdomain|local|internal|lan|home\.arpa))$/.test(host)) {
-    throw fail(`download_file 拒绝本机或内网主机名：${host}`);
-  }
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-    for (const [pattern, range] of PRIVATE_V4) {
-      if (pattern.test(host)) throw fail(`download_file 拒绝内网地址（${range}）：${host}`);
-    }
-  } else if (host.includes(':')) {
-    for (const pattern of PRIVATE_V6) {
-      if (pattern.test(host)) throw fail(`download_file 拒绝内网 IPv6 地址：${host}`);
-    }
-  }
-  return url;
-}
-
-// 域名解析到内网也算内网。解析不出来就拒绝 —— 「解析失败但请求能通」本身就很可疑。
-// TOCTOU 无法彻底消除（解析到这里、真发请求时可能已经换了答案），但这条挡掉了 review 指出的
-// 「用公共泛解析域名绕过字面检查」那一类。
-async function assertHostResolves(raw) {
-  let url;
-  try { url = new URL(String(raw)); } catch { return; }
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (!host || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) return;   // 字面地址上面已经判过
-  let records;
-  try {
-    records = await require('node:dns').promises.lookup(host, { all: true, verbatim: true });
-  } catch (error) {
-    throw fail(`download_file 无法解析主机名 ${host}：${String(error && error.message ? error.message : error).slice(0, 120)}`);
-  }
-  if (!Array.isArray(records) || records.length === 0) throw fail(`download_file 解析不到任何地址：${host}`);
-  const net = require('node:net');
-  for (const record of records) {
-    const address = String(record && record.address ? record.address : '');
-    if (!address) continue;
-    const kind = net.isIP(address);
-    if (kind === 4) {
-      for (const [pattern, range] of PRIVATE_V4) {
-        if (pattern.test(address)) throw fail(`download_file 拒绝内网地址（${range}）：${host} 解析到 ${address}`);
-      }
-    } else if (kind === 6) {
-      const lowered = address.toLowerCase();
-      for (const pattern of PRIVATE_V6) {
-        if (pattern.test(lowered)) throw fail(`download_file 拒绝内网 IPv6 地址：${host} 解析到 ${address}`);
-      }
-    }
-  }
-}
-
-// 文件名只留安全字符：basename 挡不住 '..'，而 '..' 会让落盘路径跳出 data/downloads。
-function safeDownloadName(raw) {
-  const cleaned = String(raw ?? '')
-    .replace(/[\\/]/g, '_')
-    .replace(/[^\w.\- ]+/g, '_')
-    .replace(/^\.+/, '')
-    .trim()
-    .slice(0, 100);
-  return cleaned && cleaned !== '.' && cleaned !== '..' ? cleaned : '';
-}
-
-// 只拦会被 fetch 用来改变连接目标的头，其余（Referer / Authorization 等）原样保留。
-const BLOCKED_DOWNLOAD_HEADERS = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'upgrade', 'te']);
-function sanitizeDownloadHeaders(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const out = {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (typeof key !== 'string' || !key.trim()) continue;
-    if (BLOCKED_DOWNLOAD_HEADERS.has(key.trim().toLowerCase())) continue;
-    if (typeof value !== 'string' && typeof value !== 'number') continue;
-    out[key.trim()] = String(value).slice(0, 2000);
-  }
-  return Object.keys(out).length ? out : null;
-}
-
-// 边读边算，超过上限立刻停 —— 一次性 arrayBuffer 会把整份响应读进内存。
-async function readBodyCapped(response, maxBytes) {
-  if (!response.body) return Buffer.from(await response.arrayBuffer());
-  const chunks = [];
-  let total = 0;
-  for await (const chunk of response.body) {
-    total += chunk.length;
-    if (total > maxBytes) throw new Error(`响应超过 ${maxBytes} 字节上限`);
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
+// download_file 已迁到主进程（src/actions.mjs 调 src/media.mjs 的下载器），
+// QQ 进程侧不再有这条路径：字面 IP/DNS 层 SSRF 检查、流式上限、重定向约束
+// 全部由主进程那套实现，也避开了 1 MiB 的 IPC 帧限制。
 
 // 原生方法直调表：动作名 → service 名 + 方法名 + 参数个数。
 // 加一个动作只加一行。写入类动作单独分期，避免一次 PR 里混着有副作用的路径。
@@ -450,7 +343,10 @@ function nativeRef(value, forward = false) {
     || typeof value.peerUid !== 'string' || !value.peerUid || value.peerUid.length > 64) return null;
   if (forward) return nativeId(value.root) && nativeId(value.parent)
     ? { chatType: value.chatType, peerUid: value.peerUid, root: value.root, parent: value.parent } : null;
-  return nativeId(value.msgId) ? { chatType: value.chatType, peerUid: value.peerUid, msgId: value.msgId } : null;
+  return nativeId(value.msgId) ? { chatType: value.chatType, peerUid: value.peerUid, msgId: value.msgId,
+    // msgSeq 原样带下去（接收事件里有就带，没有就空串）：forwardMsg 的 msgInfos
+    // 要「msgId + msgSeq」成对，之前把 msgId 错填进 msgSeq，review 已指出。
+    msgSeq: typeof value.msgSeq === 'string' ? value.msgSeq : '' } : null;
 }
 
 // Media descriptions are produced by the main process (src/media.mjs) after it has fetched and inspected the file.
@@ -631,19 +527,8 @@ function validateAction(request) {
   // native_call（按任意 service/method 反射调用内核）已按 review 移除：
   // 它绕过所有白名单与危险守卫，只读 PR 不应携带这种入口。
   // 本地调试需要它时用 wip 分支（那里保留了全套调试入口）。
-      if (request.action === 'download_file') {
-    const url = String(params.url ?? '').trim();
-    const b64 = String(params.base64 ?? '').trim();
-    if (!url && !b64) throw fail('download_file 需要 url 或 base64', 1400);
-    if (url) assertPublicHttpUrl(url);
-    return {
-      kind: 'download_file', action: 'download_file',
-      url, base64: b64,
-      name: safeDownloadName(params.name),
-      headers: sanitizeDownloadHeaders(params.headers),
-      maxBytes: integer(params.max_bytes, 'max_bytes', 1, 64 * 1024 * 1024, 32 * 1024 * 1024),
-    };
-  }
+  // download_file 也在主进程执行（src/actions.mjs + src/media.mjs 的下载器）：
+  // base64 载荷过不了 1 MiB 的 IPC 帧，同步落盘还会阻塞 QQ 的事件循环。
   if (request.action === 'forward_friend_single_msg' || request.action === 'forward_group_single_msg') {
     const ref = nativeRef(params.openqq_ref);
     if (!ref) throw fail(request.action + ' 的 message_id 无效或引用的消息已过期（仅支持本次运行期间收到的消息）', 1404);
@@ -961,50 +846,6 @@ function createActionHandler(session, self, current, options = {}) {
           message: String(error && error.message ? error.message : error).slice(0, 300) };
       }
     }
-    if (action.kind === 'download_file') {
-      // 落盘到 <openqq>/data/downloads/：这个目录只存下载结果，不会被当成代码或配置加载。
-      const fsMod = require('node:fs');
-      const pathMod = require('node:path');
-      const dir = pathMod.join(__dirname, '..', 'data', 'downloads');
-      fsMod.mkdirSync(dir, { recursive: true });
-      const dest = pathMod.join(dir, action.name || ('download-' + Date.now() + '.bin'));
-      let buf;
-      if (action.base64) {
-        buf = Buffer.from(String(action.base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-        if (buf.length > action.maxBytes) {
-          return { status: 'failed', retcode: 1400, data: { action: 'download_file', size: buf.length },
-            message: `base64 内容超过 ${action.maxBytes} 字节上限` };
-        }
-      } else {
-        // 字面检查在 validateAction 阶段做过了；这里补上「域名解析到内网」那一层 ——
-        // 它必须先于真正发请求，否则 nip.io 这类公共泛解析域名能一路走到 fetch。
-        try { await assertHostResolves(action.url); } catch (error) {
-          return { status: 'failed', retcode: 1400, data: { action: 'download_file', url: action.url },
-            message: String(error && error.message ? error.message : error).slice(0, 200) };
-        }
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), 60000);
-        if (timer.unref) timer.unref();
-        try {
-          // redirect: 'manual' —— 跟随重定向会让一个公网地址 302 到内网，绕过 validateAction 里的主机检查。
-          const res = await fetch(action.url, { headers: action.headers || {}, signal: ac.signal, redirect: 'manual' });
-          if (res.status >= 300 && res.status < 400) {
-            return { status: 'failed', retcode: 1400, data: { action: 'download_file', url: action.url, http: res.status },
-              message: '下载失败：目标返回重定向，download_file 不跟随（避免被导向内网）' };
-          }
-          if (!res.ok) {
-            return { status: 'failed', retcode: 1500, data: { action: 'download_file', url: action.url, http: res.status },
-              message: '下载失败：HTTP ' + res.status };
-          }
-          buf = await readBodyCapped(res, action.maxBytes);
-        } catch (error) {
-          return { status: 'failed', retcode: 1500, data: { action: 'download_file', url: action.url },
-            message: '下载失败：' + String(error && error.message ? error.message : error).slice(0, 160) };
-        } finally { clearTimeout(timer); }
-      }
-      fsMod.writeFileSync(dest, buf);
-      return { status: 'ok', retcode: 0, data: { action: 'download_file', file: dest, name: pathMod.basename(dest), size: buf.length } };
-    }
     if (action.kind === 'forward_send') {
       // 源消息：来自主进程附加的 openqq_ref，里面有真 msgId + 源会话的 peerUid（nativeRef 已校验格式）
       const src = action.source;
@@ -1034,10 +875,12 @@ function createActionHandler(session, self, current, options = {}) {
         return { status: 'failed', retcode: 1404, data: { action: action.action }, message: 'Msg.forwardMsg 不可用' };
       }
       // QQ NT 的 forwardMsg(msgInfos, target, options, callback)。
-      // msgInfos 每项要 {msgId, msgSeq}；源消息的 peerUid/chatType 来自 openqq_ref。
+      // msgInfos 每项要 {msgId, msgSeq, peerUid, chatType}；msgSeq 是消息的序号（与 msgId 是两个
+      // 不同的字段，之前把 msgId 错填进 msgSeq，review 指出）。openqq_ref 现在把接收事件里的
+      // msgSeq 一起带下来；拿不到时置空 —— 内核按 msgId 查本地记录也能定位到同一条。
       const msgInfos = [{
         msgId: String(src.msgId),
-        msgSeq: String(src.msgId),
+        msgSeq: String(src.msgSeq ?? ''),
         peerUid: String(src.peerUid),
         chatType: Number(src.chatType),
       }];
@@ -1230,4 +1073,4 @@ function createActionHandler(session, self, current, options = {}) {
   return { execute, observe, dispose };
 }
 
-module.exports = { validateAction, createActionHandler, normalizeParams, assertPublicHttpUrl, assertHostResolves };
+module.exports = { validateAction, createActionHandler, normalizeParams };
