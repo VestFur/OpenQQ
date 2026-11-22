@@ -6,23 +6,14 @@
 #include <string>
 #include <tlhelp32.h>
 
-// ===== SSO 组件加载（发布版唯一的外部加载点） =====
+// ===== SSO 通道说明 =====
 //
-// 契约：组件是一个只依赖 KERNEL32 的独立 DLL，被 LoadLibrary 进 QQ 进程后
-// 自建命名管道，JS 侧（native/sso-pipe.cjs）按 QHP1 帧格式发包。组件自己决定
-// 怎么在进程内把包送到 QQ 的 SSO 链上；本文件不碰、也不需要知道那套细节。
+// 发送 SSO 包不加载任何外部组件：4 字节补丁让 QQ 自己的
+// Msg.sendSsoCmdReqByContend 接收二进制 body（见 ssoBodyConvInstall），包由 QQ 发、
+// 回包也由 QQ 收。曾经存在过的「按名字 LoadLibrary 一个 SSO 转发组件」机制已整体移除，
+// loadSsoBridge() 有意为空。
 //
-// 按优先级尝试，**找到第一个就用，不叠加**：
-//   ① 自研组件  openqq-sso-local.dll      —— 我们自己维护，用户可选安装
-//   ② 外部组件  snowluma-win32-x64.dll    —— 第三方，用户自行安装
-// 都没有就静默跳过，OpenQQ 退回「内核 JS + 纯 HTTP」路径：功能降级但不崩。
-//
-// 覆盖方式：
-//   OPENQQ_SSO_PROVIDER=none|local|snowluma   只启用指定的一个
-//   OPENQQ_LOCAL_SSO_DLL=<绝对路径>           自研组件的路径
-//   OPENQQ_SL_DLL=<绝对路径>                  外部组件的路径
-//
-// ⚠️ 发布版只允许保留「按名字 LoadLibrary」这一种动作。任何内存扫描、
+// ⚠️ 发布版只允许保留「静态偏移 + 一次性写跳板」这一种动作。任何内存扫描、
 // 地址读取、函数挂接都必须留在 OPENQQ_ENABLE_PROBE 的调试构建里，
 // 否则会被安全软件按通用可疑特征拦截（build-native.mjs 有护栏兜底）。
 static std::wstring selfModuleDir() {
@@ -59,15 +50,12 @@ static bool tryLoadOne(const std::wstring& dir, const char* envName, const wchar
     return LoadLibraryW(path.c_str()) != nullptr;
 }
 
-// SSO 通道不再依赖任何外部组件（2026-11-21）。
+// SSO 通道不依赖任何外部组件。
 //
 // 现在的做法：用 4 字节补丁让 QQ 自己的 Msg.sendSsoCmdReqByContend 能接收二进制 body，
-// 所以既不需要 SnowLuma，也不需要自研的 openqq-sso-local.dll。
-//
-// 历史：这里原本会按 OPENQQ_SSO_PROVIDER 去 LoadLibrary("snowluma-win32-x64.dll")。
-// 那正是验收④要杜绝的运行时依赖 —— 现已被彻底移除，任何情况下都不会再加载它。
+// 包由 QQ 自己发、回包也由 QQ 收 —— 没有任何第三方运行时依赖。
 static void loadSsoBridge() {
-    // 有意为空：不要在这里 LoadLibrary 任何东西。
+    // 有意为空：不加载任何东西。
 }
 
 template<class T> static T api(HMODULE module, const char* name) {
@@ -82,7 +70,7 @@ static void check(int status) {
 // ===== 自研 SSO 的 C++ 侧入口（只读探针） =====
 //
 // 为什么必须有这一段：QQ 只给 JS 暴露了一个 sendSsoCmdReqByContend，实测它是本地
-// 白名单网关 —— 同一个包（OidbSvcTrpcTcp.0x102a_0）走 SnowLuma 的管道能拿到
+// 白名单网关 —— 同一个包（OidbSvcTrpcTcp.0x102a_0）走某些转发组件的进程内管道能拿到
 // pskey（status 0），走这个 JS 口只返回 {}、0 毫秒，且把 onNetReply /
 // onDispatchRequestReply / onDispatchPush / onDispatchPushWithJson /
 // onUIConfigUpdate 五条回包通道全挂上之后 5 秒 0 事件，包根本没出进程。
@@ -342,8 +330,8 @@ static void* nativeProbeCallback(void* env, void* info) {
 // __openqqNativeScan(target, start, count) -> { unwrapStatus, ptr, scanned, candidates:[{offset,value,module}] }
 //
 // 一次扫完一段槽位，只返回「值本身指向可执行段」的候选。为什么要有它：
-// SnowLuma 用的是硬编码偏移（发包函数在 +0x70，分配器在 +0x78，另一套在 +0x108/+0x110），
-// 那种写法换一个 QQ 版本就会失效。我们要的是版本无关——所以不写死偏移，而是在运行时
+// 常见实现把发包函数写死在固定偏移上（如 +0x70/0x78、+0x108/0x110），
+// 换一个 QQ 版本就会失效。我们要的是版本无关——所以不写死偏移，而是在运行时
 // 扫一遍对象的槽位，把「看起来是函数指针」的全部列出来，再按版本缓存结果。
 // 扫描全程只读 + VirtualQuery 卡边界，不调用任何读到的地址。
 static void* nativeScanCallback(void* env, void* info) {
@@ -1358,7 +1346,7 @@ static void installProbe(HMODULE, void*, void*, void*) {}
 //            const { const char* data; size_t len; }* body, int wantReply,
 //            std::string* replyOut)
 //
-// 为什么放在发布版而不是探针里：这是「不依赖 SnowLuma 也能发 SSO」的落点，
+// 为什么放在发布版而不是探针里：这是「不依赖任何第三方组件也能发 SSO」的落点，
 // 用户装完就能用。整条路径只有「napi_unwrap 取指针 → 读两个固定偏移 → 一次调用」，
 // 不写代码段、不 VirtualProtect、不遍历内存、不装全局钩子。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2230,108 +2218,6 @@ static void* ssoBodyConvCallback(void* env, void* info) {
 
 // __openqqSsoSend(msfServiceObject, cmd, bodyHex, dryRun) -> 诊断对象
 //   dryRun 缺省为 true：只校验「这个对象是不是 MSFService、发送路径是否就绪」，不发包。
-// __openqqSsoSendRaw(cmd, bodyHex, dryRun) -> 诊断对象
-// 与 __openqqSsoSend 的唯一区别：session 不用调用方传，native 自己解析
-// GetModuleHandle("snowluma-win32-x64.dll") + 0x70088（SL 的 504 字节静态结构体）。
-// 目的：验证「SL 拿自己的结构体当 session 传给 0x765d70」这个假设。
-// 这个入口只在调试版存在（发布版没有 loadSsoBridge 之外的 SL 引用）。
-#if defined(OPENQQ_ENABLE_PROBE)   // __openqqSsoSendRaw 依赖 SL 结构体，仅调试版
-static void* ssoSendRawCallback(void* env, void* info) {
-    void* out = nullptr;
-    g_sso.createObject(env, &out);
-    auto setNum = [&](const char* k, double v) {
-        void* n = nullptr;
-        if (g_sso.createDouble && g_sso.createDouble(env, v, &n) == 0 && n) g_sso.setNamed(env, out, k, n);
-    };
-    auto setStr = [&](const char* k, const char* v) {
-        void* s = nullptr;
-        if (g_sso.createStr && g_sso.createStr(env, v, strlen(v), &s) == 0 && s) g_sso.setNamed(env, out, k, s);
-    };
-    auto setB = [&](const char* k, bool v) {
-        void* b = nullptr;
-        if (g_sso.createBool && g_sso.createBool(env, v, &b) == 0 && b) g_sso.setNamed(env, out, k, b);
-    };
-
-    size_t argc = 3;
-    void* argv[3] = {nullptr, nullptr, nullptr};
-    if (!g_sso.getCbInfo || g_sso.getCbInfo(env, info, &argc, argv, nullptr, nullptr) != 0) {
-        setStr("note", "getCbInfo 失败");
-        return out;
-    }
-    char cmdBuf[256] = {0};
-    size_t cmdLen = 0;
-    if (!argv[0] || g_sso.getStr(env, argv[0], cmdBuf, sizeof(cmdBuf) - 1, &cmdLen) != 0) {
-        setStr("note", "cmd 不是字符串");
-        return out;
-    }
-    char hexBuf[8192] = {0};
-    size_t hexLen = 0;
-    if (argc >= 2 && argv[1]) g_sso.getStr(env, argv[1], hexBuf, sizeof(hexBuf) - 1, &hexLen);
-    bool dryRun = true;
-    if (argc >= 3 && argv[2] && g_sso.getBool) {
-        bool b = false;
-        if (g_sso.getBool(env, argv[2], &b) == 0) dryRun = b;
-    }
-
-    HMODULE sl = GetModuleHandleW(L"snowluma-win32-x64.dll");
-    if (!sl) {
-        setStr("note", "snowluma 未加载，无法取它的结构体");
-        setB("slLoaded", false);
-        return out;
-    }
-    setB("slLoaded", true);
-    unsigned char* slBase = reinterpret_cast<unsigned char*>(sl);
-    void* session = slBase + 0x70088;
-    setNum("slBase", (double)(size_t)slBase);
-    setNum("session", (double)(size_t)session);
-
-    long long ready = 0;
-    memcpy(&ready, reinterpret_cast<unsigned char*>(session) + kOffSendReady, 8);
-    setNum("sendReady", (double)ready);
-    setB("sendReadyOk", ready != 0);
-
-    // 解 body hex
-    size_t bodyLen = 0;
-    for (size_t i = 0; i + 1 < hexLen; i += 2) {
-        auto hv = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            return -1;
-        };
-        const int hi = hv(hexBuf[i]), lo = hv(hexBuf[i + 1]);
-        if (hi < 0 || lo < 0) break;
-        if (bodyLen < sizeof(g_ssoBody)) g_ssoBody[bodyLen++] = static_cast<unsigned char>((hi << 4) | lo);
-    }
-    setNum("bodyLen", (double)bodyLen);
-    if (dryRun) {
-        setStr("note", "dryRun：已解析 SL 结构体，未发送");
-        return out;
-    }
-
-    unsigned char* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(L"wrapper.node"));
-    if (!base) { setStr("note", "wrapper.node 未加载"); return out; }
-    void* cmdStr = ssoCmdString(cmdBuf, base);
-    if (!cmdStr) { setStr("note", "cmd 缓存已满"); return out; }
-    // MSVC std::function 布局（0x20 字节）：
-//   [0x00..0x0F] functor 存储（无捕获 lambda 全零即可）
-//   [0x10] invoker 函数指针
-//   [0x18] deleter 函数指针
-// 依据：0x76669c 在栈上构造时就是 mov [r9+0x10]=0x180002334 / [r9+0x18]=0x180002366。
-// 之前把两个指针放 +0/+8 是错的，0x765d70 拿到垃圾结构 → 卡死。
-struct SsoFunc { unsigned char storage[0x10]; void* invoke; void* destroy; };
-    SsoFunc cbPair{};
-    cbPair.invoke = base + 0x2334;
-    cbPair.destroy = base + 0x2366;
-    SsoSpan span{reinterpret_cast<const char*>(g_ssoBody), bodyLen};
-    typedef int (*SendPrimFn)(void*, void*, void*, unsigned char, void*);
-    SendPrimFn sendPrim = reinterpret_cast<SendPrimFn>(base + kRvaSendPrim);
-    int rc = -1; if (InterlockedCompareExchange(&g_ssoJob.state,1,0)==0){ g_ssoJob.thisObj=(void*)(size_t)session; g_ssoJob.cmdStr=cmdStr; g_ssoJob.bodyData=(const char*)g_ssoBody; g_ssoJob.bodyLen=bodyLen; void* th=CreateThread(nullptr,0,ssoAsyncWorker,nullptr,0,nullptr); if(th){CloseHandle(th); rc=0;} else {InterlockedExchange(&g_ssoJob.state,0);} }
-    setNum("sendRc", (double)rc);
-    setStr("note", "已用 SL 结构体当 session 调 0x765d70");
-    return out;
-}
-#endif  // OPENQQ_ENABLE_PROBE（SsoSendRaw）
 
 // __openqqSsoSend：废弃的「native 直发」实验入口。
 // 它里面有一个 rawSessionMode —— argv[0] 传十进制地址字符串就能当 session 直接解引用，
@@ -2364,7 +2250,6 @@ static void* ssoSendCallback(void* env, void* info) {
     setNum("argc", (double)argc);
 
     // raw session 模式：argv[0] 传十进制地址字符串时，直接当 session 用。
-    // 验证假设：SnowLuma 把 DAT_180070088（它自己的 504 字节结构体）当 session 传给 0x765d70。
     void* sessionOverride = nullptr;
     {
         char rawArg[64] = {0};
@@ -2612,15 +2497,7 @@ static void installSsoSend(HMODULE runtime, void* env, void* globalObject) {
     if (g_sso.createFunction(env, "openqqSsoSend", SIZE_MAX,
                              reinterpret_cast<void*>(&ssoSendCallback), nullptr, &fn) == 0 && fn) {
         g_sso.setNamed(env, globalObject, "__openqqSsoSend", fn);
-#if defined(OPENQQ_ENABLE_PROBE)
-        {
-            void* fn2 = nullptr;
-            if (g_sso.createFunction && g_sso.createFunction(env, "__openqqSsoSendRaw", 18,
-                reinterpret_cast<void*>(&ssoSendRawCallback), nullptr, &fn2) == 0 && fn2) {
-                g_sso.setNamed(env, globalObject, "__openqqSsoSendRaw", fn2);
-            }
-        }
-#endif  // OPENQQ_ENABLE_PROBE（SsoSendRaw 注册）
+
     }
 #endif  // OPENQQ_ENABLE_PROBE（SsoSend 注册）
 }
