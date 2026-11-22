@@ -23,7 +23,10 @@ function loadActions() {
   }
   // actions.cjs 本身不能走 require：实测清完 require.cache 再 require，拿到的仍是旧模块，
   // 表现是重载看着成功、新加的 validateAction 分支却照样回「尚未支持动作」。
-  // 改读源码 + 用全新 Module 实例求值，不经过 require.cache，新增分支/新增表项必然生效。
+  // 改读源码 + 用全新 Module 实例求值，不经过 require.cache，所以拿到的确实是磁盘上的最新代码。
+  // 但「改了就生效」只对 handler 成立：主进程 src/actions.mjs 持有的是启动时那份 validateAction，
+  // 换不到新的。所以动到「注册面」（新增 validateAction 分支、给动作表新增键）仍然需要重启，
+  // 完整边界见 docs/hot-attach.md 里那张表。
   const source = nodeFs.readFileSync(actionsPath, 'utf8');
   const fresh = new Module(actionsPath, null);
   fresh.filename = actionsPath;

@@ -15,10 +15,17 @@ const SOCKET_PREFIX = 'openqq-';
 export function allocateChannelPath() {
   const id = randomBytes(16).toString('hex');
   if (process.platform === 'win32') return { path: `${PIPE_PREFIX}${id}` };
-  const base = tmpdir();
-  const preferred = join(base, `${SOCKET_PREFIX}${id}.sock`);
-  // Unix domain socket 的 sun_path 上限通常是 104~108 字节，太长 listen 会失败，退到 /tmp。
-  return { path: Buffer.byteLength(preferred) <= 100 ? preferred : join('/tmp', `${SOCKET_PREFIX}${id}.sock`) };
+  // socket 放在 0700 的专属目录里，而不是直接摊在 /tmp：/tmp 对其他用户可读，随机名字会暴露，
+  // 在「OpenQQ 重启删掉 socket、QQ 侧还在每 300ms 重连 hello」的窗口里同机其他用户可能抢占路径拿令牌。
+  // 目录名同样随机，权限 0700 —— 别人连枚举都做不到。
+  const dir = join(tmpdir(), `${SOCKET_PREFIX}${id}`);
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* 建不出来就走下面的回退 */ }
+  const preferred = join(dir, 'openqq.sock');
+  // Unix domain socket 的 sun_path 上限通常是 104~108 字节，太长 listen 会失败，退到 /tmp 下的同名目录。
+  if (Buffer.byteLength(preferred) <= 100) return { path: preferred };
+  const fallbackDir = join('/tmp', `${SOCKET_PREFIX}${id}`);
+  try { mkdirSync(fallbackDir, { recursive: true, mode: 0o700 }); } catch { /* 同上 */ }
+  return { path: join(fallbackDir, 'openqq.sock') };
 }
 
 // 端点形状必须和当前平台一致：换了平台（或换了机器）时旧的 ipc.json 指向一个本机根本不存在的
@@ -68,7 +75,13 @@ export function clearStaleSocket(path) {
   return new Promise(resolve => {
     const probe = createConnection(path);
     probe.once('connect', () => { probe.destroy(); resolve(false); });
-    probe.once('error', () => { try { unlinkSync(path); } catch { /* 删不掉就让 listen 报 EADDRINUSE */ } resolve(true); });
+    probe.once('error', err => {
+      // 只有 ECONNREFUSED 能证明「文件还在但没人听」。EACCES / EPERM 之类说明我们连判断的权限都没有，
+      // 这时删文件可能误伤另一个正在服务的实例，宁可让后面的 listen 自己去报 EADDRINUSE。
+      if (err && err.code !== 'ECONNREFUSED') { resolve(false); return; }
+      try { unlinkSync(path); } catch { /* 删不掉就让 listen 报 EADDRINUSE */ }
+      resolve(true);
+    });
   });
 }
 

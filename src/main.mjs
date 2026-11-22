@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, renameSync, readFileSync, createWriteStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -23,23 +23,11 @@ import { createImageClient } from './bot/image.mjs';
 import { createBotEngine } from './bot/engine.mjs';
 import { createBotApi } from './bot/api.mjs';
 
-// 运行中的 QQ 里有没有我们的原生模块。QQ 允许多开、各账号分区独立，所以机器上同时开着
-// 别的账号的 QQ 是正常情况——那不是"附着失败"，而是"该另起一个实例"。
-// 查不出来时按"是我们的"处理，保持原来更保守的行为。
-function runningQQIsOurs() {
-  if (process.platform !== 'win32') return true;
-  try {
-    const ps = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-    const out = execFileSync(ps, [
-      '-NoProfile', '-NonInteractive', '-Command',
-      "Get-Process QQ -ErrorAction SilentlyContinue | ForEach-Object { try { if ($_.Modules | Where-Object { $_.ModuleName -like '*openqq-bootstrap*' }) { 'openqq' } } catch {} }",
-    ], { encoding: 'utf8', windowsHide: true, timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] });
-    return String(out).includes('openqq');
-  } catch {
-    return true;
-  }
-}
-
+// 运行中的 QQ 里有没有我们的原生模块 —— 这段判断已经撤掉。
+// 走到「QQ 在运行但 6 秒内没连回固定端点」这一步时，一律按改造前那条原始错误处理：请用户先退出 QQ。
+// 理由：① 用 PowerShell 同步枚举各进程的 Modules 本身既慢（提权或安全软件环境下还可能直接拿不到结果），
+// 判错了就会往一个已经在跑的 QQ 里重复注入；② QQ 多开（bot 号和自己号分开）的支持是独立的设计问题，
+// 留给单独的 PR 讨论，不在这一个里夹带。
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimeDir = join(projectDir, '.runtime');
 // Bot 的数据（积木程序、记忆、AI 设置和 Key）放在 data/bot，不放在会被清理的 .runtime 里；容器部署请挂载这个目录。
@@ -115,6 +103,16 @@ async function start(qq, config, existingWebUI) {
   let current = { phase: 'starting', version: qq.version, bootstrap: 'cpp-native' };
   const ipcParams = ensureIpcParams(runtimeDir);
   const channel = await createNativeChannel(ipcParams.pipe, ipcParams.token);
+  // 事件监听必须早于「等附着」建立：热附着时 QQ 侧在同一个 data 回调里连发 hello + session_ready(resumed)，
+  // 等我们把 WebUI / OneBot 起完再来注册监听，那条 session_ready 就已经过去了 —— phase 会永远停在
+  // hook_installed，self_id 缺失，图形化 Bot 也不会触发。这里先挂一个转接器，正式处理器就绪前的
+  // 事件原样排队，接上之后按顺序补发。
+  let eventSink = null;
+  const pendingEvents = [];
+  channel.events.on('event', event => {
+    if (eventSink) eventSink(event);
+    else pendingEvents.push(event);
+  });
   // 优先附着：QQ 已在运行、且里面那份原生脚本还在（它会自己连回固定端点）时，等它连回来，完全不碰 QQ。
   // 连不回来就说明那个 QQ 不是我们注入的实例。这时既不能附着，也不能再拉一个启动器（会往一个已经
   // 跑着的 QQ 里重复注入），只能请用户先退出 QQ —— 也就是改造前那条原始错误的含义。
@@ -130,15 +128,10 @@ async function start(qq, config, existingWebUI) {
       });
     });
     if (!attached) {
-      // 附着不上有两种完全不同的原因，不能一律报"请先退出 QQ"：
-      //  · 运行中的 QQ 里装着我们的原生模块 → 那是同一个实例但端点没连回来（真异常）。
-      //  · 运行中的 QQ 是另一个账号（QQ 允许多开，各账号分区独立）→ 它根本不是我们的目标，
-      //    另起一个实例才是对的。多账号机器上很常见，不该要求用户把自己的 QQ 关掉。
-      if (runningQQIsOurs()) {
-        await channel.close();
-        throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
-      }
-      out.log('info', '运行中的 QQ 不是 OpenQQ 注入的实例（另一个账号），将以独立实例启动');
+      // QQ 正在运行、却没能自己连回固定端点：要么它里面没有我们的原生模块，要么模块在但通道断了。
+      // 两种情况都不能再拉一个启动器（会往一个正在跑的 QQ 里重复注入），统一请用户先退出 QQ。
+      await channel.close();
+      throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
     }
     if (attached) out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
   }
@@ -193,17 +186,21 @@ async function start(qq, config, existingWebUI) {
   let finish;
   let reject;
   const stopped = new Promise((resolve, fail) => { finish = resolve; reject = fail; });
-  const startupTimeout = setTimeout(() => reject(new Error('原生脚本未在 35 秒内连接 IPC；请查看上方原生引导日志')), 35000);
+  // 热附着时这条超时没有意义：connected 已经在「等附着」那一步触发过一次（用的是 once，已经消耗掉），
+  // 附着模式下不会再收到第二次 connected，到点就会把一个正常运行中的进程误判成「原生脚本没连上」退出。
+  // 只有非附着（要拉起新 QQ）时才需要这条兜底。
+  const startupTimeout = attached ? null
+    : setTimeout(() => reject(new Error('原生脚本未在 35 秒内连接 IPC；请查看上方原生引导日志')), 35000);
   const onSignal = () => finish();
   process.once('SIGINT', onSignal);
   process.once('SIGTERM', onSignal);
   channel.events.on('connected', ({ pid }) => {
-    clearTimeout(startupTimeout);
+    if (startupTimeout) clearTimeout(startupTimeout);
     current = { ...current, phase: 'hook_installed', pid };
     saveStatus();
     out.log('ok', `原生脚本已载入 QQ（PID ${pid}），请在 QQ 窗口正常登录`);
   });
-  channel.events.on('event', event => {
+  eventSink = event => {
     try {
       if (['message', 'notice', 'request'].includes(event.type)) {
         const converted = convert(event);
@@ -233,7 +230,9 @@ async function start(qq, config, existingWebUI) {
       out.log('warn', '事件未转换：' + error.message);
       webui.publish('diagnostic', { type: 'event_error', stage: 'convert', error: error.message });
     }
-  });
+  };
+  // 处理器就绪，把等附着期间排下队的事件按原顺序补发（热附着的 session_ready 就在这里）。
+  for (const event of pendingEvents.splice(0)) eventSink(event);
   channel.events.once('disconnected', finish);
   channel.events.on('failure', reject);
   let driver = null;

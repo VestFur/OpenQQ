@@ -1,4 +1,4 @@
-﻿import { test } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { copyFileSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
