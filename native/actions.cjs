@@ -161,6 +161,14 @@ function validateAction(request) {
   // 危险动作（danger:true，不可撤回且影响他人）默认只构造不发送，必须显式传 confirm_danger。
   if (oidb.OIDB_ACTIONS[request.action]) {
     const act = oidb.OIDB_ACTIONS[request.action];
+    // 有一批 OIDB 动作的字段要 NT UID（u_...），而 OneBot 给的是数字 QQ 号。
+    // 换 uid 要 await getUserDetailInfoByUin，而 validateAction 是同步的 —— 所以这类动作
+    // 在这里**先不编码**，把原始 params 带下去，由执行侧换完 uid 再 buildOidbBody。
+    if (Array.isArray(act.needsUid)) {
+      return { kind: 'sso_pipe', action: request.action, cmd: act.wire,
+        body: null, needsUid: act.needsUid, params, danger: Boolean(act.danger),
+        confirmDanger: params.confirm_danger === true };
+    }
     let body;
     try { body = oidb.buildOidbBody(request.action, params); }
     catch (e) { throw fail(`${request.action} 参数无效: ${e && e.message ? e.message : e}`, 1400); }
@@ -392,6 +400,37 @@ function createActionHandler(session, self, current, options = {}) {
       } };
     }
     if (action.kind === 'sso_pipe') {
+      // 声明了 needsUid 的 OIDB 动作在这里才编码：先把它的字段从 QQ 号换成 NT UID。
+      // validateAction 是同步的，没法在那边 await，所以 body 留到这一步才生成。
+      if (Array.isArray(action.needsUid) && !action.body) {
+        const params = { ...(action.params || {}) };
+        for (const key of action.needsUid) {
+          const asText = String(params[key] ?? '');
+          if (!asText || asText.startsWith('u_')) continue;
+          if (!/^\d{5,12}$/.test(asText)) continue;
+          let uid = '';
+          try {
+            const profile = serviceOf('Profile');
+            if (profile && typeof profile.getUserDetailInfoByUin === 'function') {
+              const det = await profile.getUserDetailInfoByUin(asText);
+              uid = String((det && det.detail && (det.detail.uid || (det.detail.simpleInfo && det.detail.simpleInfo.uid))) || '');
+            }
+          } catch (error) {
+            throw fail('把 QQ 号换成 NT UID 时抛错：' + String(error && error.message ? error.message : error).slice(0, 140), 1500);
+          }
+          if (!uid) throw fail(`拿不到 ${asText} 的 NT UID（getUserDetailInfoByUin 返回空）—— 这个动作要的是 u_... 形式，不是数字号`, 1400);
+          params[key] = uid;
+        }
+        let built;
+        try { built = oidb.buildOidbBody(action.action, params); }
+        catch (e) { throw fail(`${action.action} 参数无效: ${e && e.message ? e.message : e}`, 1400); }
+        if (action.danger && !action.confirmDanger) {
+          return { status: 'failed', retcode: 1404, data: { action: action.action, cmd: action.cmd,
+            bodyHex: built.toString('hex'), bodyLen: built.length, sent: false,
+            note: '危险动作（不可撤回且影响他人）：默认只构造不发送。确认要真发时传 confirm_danger: true' } };
+        }
+        action.body = built;
+      }
       // 判据：status 0 + 有 body = 服务端真回了；status 非 0 时 note 是服务端原文。
       if (action.action === 'sso_pipe_status') {
         // 探活 = 问一次补丁装没装。装上了才算通道就绪。

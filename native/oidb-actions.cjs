@@ -305,7 +305,7 @@ const OIDB_ACTIONS = {
   },
 
   // ---- 危险动作（默认只构造不发送，需 confirm_danger: true）----
-  set_group_kick_members: {
+  set_group_kick_members: { needsUid: ['user_id'],
     command: 2208, subCommand: 1, wire: 'OidbSvcTrpcTcp.0x8a0_1',
     body: {
       1: { name: 'groupId', kind: 'varint' },
@@ -320,17 +320,6 @@ const OIDB_ACTIONS = {
       rejectAddRequest: p.reject_add_request ? 1 : 0,
       kickReason: Buffer.from(String(p.reason ?? ''), 'utf8'),
     }),
-    danger: true,
-  },
-
-  set_group_admin: {
-    command: 4246, subCommand: 1, wire: 'OidbSvcTrpcTcp.0x1096_1',
-    body: {
-      1: { name: 'groupUin', kind: 'varint' },
-      2: { name: 'uid', kind: 'string' },
-      3: { name: 'isAdmin', kind: 'varint' },
-    },
-    build: (p) => ({ groupUin: p.group_id, uid: String(p.user_id ?? ''), isAdmin: p.enable ? 1 : 0 }),
     danger: true,
   },
 
@@ -449,7 +438,7 @@ const OIDB_ACTIONS = {
   },
 
   // ---- 禁言单个成员：0x1253_1 ----
-  mute_group_member: {
+  mute_group_member: { needsUid: ['user_id'],
     command: 4691, subCommand: 1, wire: 'OidbSvcTrpcTcp.0x1253_1',
     body: {
       1: { name: 'groupUin', kind: 'varint' },
@@ -487,16 +476,6 @@ const OIDB_ACTIONS = {
   },
 
   // ---- 点赞：0x7e5_104 ----
-  send_like: {
-    command: 2021, subCommand: 104, wire: 'OidbSvcTrpcTcp.0x7e5_104',
-    body: {
-      1: { name: 'targetUid', kind: 'string' },
-      2: { name: 'sourceId', kind: 'varint' },
-      3: { name: 'count', kind: 'varint' },
-    },
-    build: (p) => ({ targetUid: String(p.user_id ?? ''), sourceId: 0, count: Math.min(20, Math.max(1, Number(p.times ?? 1))) }),
-  },
-
   // ---- 图片 OCR：0xe07_0 ----
   image_ocr: {
     command: 3591, subCommand: 0, wire: 'OidbSvcTrpcTcp.0xe07_0',
