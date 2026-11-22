@@ -24,10 +24,31 @@ import { createBotEngine } from './bot/engine.mjs';
 import { createBotApi } from './bot/api.mjs';
 
 // 运行中的 QQ 里有没有我们的原生模块 —— 这段判断已经撤掉。
-// 走到「QQ 在运行但 6 秒内没连回固定端点」这一步时，一律按改造前那条原始错误处理：请用户先退出 QQ。
-// 理由：① 用 PowerShell 同步枚举各进程的 Modules 本身既慢（提权或安全软件环境下还可能直接拿不到结果），
-// 判错了就会往一个已经在跑的 QQ 里重复注入；② QQ 多开（bot 号和自己号分开）的支持是独立的设计问题，
-// 留给单独的 PR 讨论，不在这一个里夹带。
+// 理由：用 PowerShell 同步枚举各进程的 Modules 既慢（提权或安全软件环境下还可能直接拿不到结果），
+// 判错了就会往一个已经在跑的 QQ 里重复注入。改成记住「上次成功挂接的那个 QQ 的 PID」，
+// 那是一次数值比较，不进别人的进程，也不需要任何权限。
+// 惰性求值：runtimeDir 在本文件后面才定义，这里只登记「去哪找」，等真正调用时再拼路径。
+const qqStatePath = () => join(runtimeDir, 'qq.json');
+
+function rememberQqPid(pid) {
+  const value = Number(pid);
+  if (!Number.isInteger(value) || value <= 0) return;
+  try { writeFileSync(qqStatePath(), JSON.stringify({ pid: value, at: new Date().toISOString() }, null, 2)); } catch { /* 记不住就下次当未知处理 */ }
+}
+
+function lastQqPid() {
+  try {
+    const saved = JSON.parse(readFileSync(qqStatePath(), 'utf8'));
+    return Number.isInteger(saved?.pid) ? saved.pid : null;
+  } catch { return null; }
+}
+
+// 只判「这个 PID 还在不在」，不读它的任何东西。EPERM 说明进程活着但当前身份看不到细节 —— 仍算活着。
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === 'EPERM'; }
+}
+
 const projectDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimeDir = join(projectDir, '.runtime');
 // Bot 的数据（积木程序、记忆、AI 设置和 Key）放在 data/bot，不放在会被清理的 .runtime 里；容器部署请挂载这个目录。
@@ -119,21 +140,42 @@ async function start(qq, config, existingWebUI) {
   let attached = false;
   if (isQQProcessRunning()) {
     out.log('info', '检测到 QQ 正在运行，尝试直接附着（不重启 QQ）…');
-    attached = await new Promise(resolve => {
-      const timer = setTimeout(() => resolve(false), 6000);
-      channel.events.once('connected', info => {
-        clearTimeout(timer);
-        current = { ...current, phase: 'hook_installed', pid: info.pid };
-        resolve(true);
+    // 等两轮：QQ 侧每 300 毫秒重连一次，通道刚断时第一轮很可能正好错过。
+    // 两轮之内连回来都算「热注入成功」，一次都不成功才去打扰用户。
+    for (let round = 0; round < 2 && !attached; round += 1) {
+      attached = await new Promise(resolve => {
+        const timer = setTimeout(() => resolve(false), 6000);
+        const onConnected = info => {
+          clearTimeout(timer);
+          current = { ...current, phase: 'hook_installed', pid: info.pid };
+          rememberQqPid(info.pid);
+          resolve(true);
+        };
+        channel.events.once('connected', onConnected);
+        // 超时分支必须自己摘掉监听器：留着它，后面真连回来时还会再进一次这个已经作废的回调。
+        setTimeout(() => channel.events.off?.('connected', onConnected), 6100).unref?.();
       });
-    });
-    if (!attached) {
-      // QQ 正在运行、却没能自己连回固定端点：要么它里面没有我们的原生模块，要么模块在但通道断了。
-      // 两种情况都不能再拉一个启动器（会往一个正在跑的 QQ 里重复注入），统一请用户先退出 QQ。
-      await channel.close();
-      throw new Error('请先手动退出 QQ，再由 OpenQQ 在原生模块加载前启动挂接');
+      if (!attached && round === 0) out.log('info', '第一轮没连上，再试一轮…');
     }
-    if (attached) out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
+    if (!attached) {
+      // 走到这里说明：这台机器上确实有 QQ 在跑，但它没能在 12 秒内连回我们的端点。
+      // 绝不自己再拉一个、也绝不杀掉它 —— 这两种动作只能由用户决定。下面按「我们自己记着的那个
+      // QQ 还在不在」给一条能直接照做的提示，而不是笼统地让人退出 QQ。
+      await channel.close();
+      const boundPid = lastQqPid();
+      if (boundPid && pidAlive(boundPid)) {
+        throw new Error(`OpenQQ 之前挂接的 QQ（PID ${boundPid}）还在运行，但它的原生模块没有连回来。`
+          + '请重启那个 QQ —— 模块只在 QQ 启动时加载，重启是唯一能重新注入的方式；'
+          + '如果不方便重启 QQ，先退出本程序再启动一次，多数情况下也能让模块重新连上');
+      }
+      if (boundPid) {
+        throw new Error(`OpenQQ 之前挂接的 QQ（PID ${boundPid}）已经关闭。`
+          + '请先启动 QQ，再启动 OpenQQ；本次不会替你启动或结束任何 QQ 进程');
+      }
+      throw new Error('检测到 QQ 正在运行，但它里面没有 OpenQQ 的原生模块（不是本程序挂接的实例）。'
+        + '如果要让 OpenQQ 接管，请先退出那个 QQ 再启动 OpenQQ；本次不会替你启动或结束任何 QQ 进程');
+    }
+    out.log('info', '已附着到运行中的 QQ（QQ 没有被重启）');
   }
   let network;
   // message_id values survive a restart: the mapping to QQ's own ids is kept in .runtime/ids.json.
@@ -197,6 +239,9 @@ async function start(qq, config, existingWebUI) {
   channel.events.on('connected', ({ pid }) => {
     if (startupTimeout) clearTimeout(startupTimeout);
     current = { ...current, phase: 'hook_installed', pid };
+    // 记下来：下次启动时用它判断「上次挂接的那个 QQ 还在不在」，据此给针对性的提示，
+    // 而不是不问缘由地让用户退出 QQ。
+    rememberQqPid(pid);
     saveStatus();
     out.log('ok', `原生脚本已载入 QQ（PID ${pid}），请在 QQ 窗口正常登录`);
   });
