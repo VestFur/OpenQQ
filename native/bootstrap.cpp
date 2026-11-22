@@ -1639,17 +1639,37 @@ static bool ssoStdStringFromBytes(void* dst24, const unsigned char* data, size_t
         return true;
     }
 
-    // 长串：cap = len|15，用 QQ 的 operator new 分配 cap+1
+    // 长串：cap = len|15，用 QQ 的 operator new 分配 cap+1。
+    // 2026-11-22 修正 __cap_ 编码：libc++ 的 __set_long_cap 写入的是「实际分配字节数 | 1」
+    // （分配 cap+1 字节 → __cap_ = (cap+1)|1），不是 cap|1。旧写法在 len=31 时声称容量
+    // (31&~1)=30，小于实际分配的 32 字节；一旦 QQ 侧按 __cap_ 做容量判断就会误判。
     auto opNew = reinterpret_cast<void* (*)(size_t)>(base + kRvaOperatorNew);
     const size_t cap = (len | 0xf);
     auto* heap = reinterpret_cast<unsigned char*>(opNew(cap + 1));
     if (!heap) return false;
     for (size_t i = 0; i < len; ++i) heap[i] = data[i];
     heap[len] = 0;
-    *reinterpret_cast<size_t*>(p + 0x00) = cap | 1;    // 最低位 1 = 长串
+    *reinterpret_cast<size_t*>(p + 0x00) = (cap + 1) | 1;   // allocated_size | 1（最低位 1 = 长串）
     *reinterpret_cast<size_t*>(p + 0x08) = len;
     *reinterpret_cast<size_t*>(p + 0x10) = reinterpret_cast<size_t>(heap);
     return true;
+}
+
+// 校验 operator new 落点特征：0xbdb3fc 的真实序言是
+//   56 48 83 EC 20 48 89 CE   (push rsi; sub rsp,0x20; mov rsi,rcx)
+//   E8 rel32                  (call 0xbdbb6f，rel = 0x766)
+// 任何一项不符 → 这是别的版本/别的函数，长串路径放弃（宁可不发畸形串，也不乱调）。
+static bool ssoReadable(const void* p, size_t n);   // 定义在下方；这里先用
+static bool ssoOperatorNewLooksRight(unsigned char* base) {
+    if (!ssoReadable(base + kRvaOperatorNew, 13)) return false;
+    static const unsigned char kOpNewPrologue[] = {0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x89, 0xCE, 0xE8};
+    for (size_t i = 0; i < sizeof(kOpNewPrologue); ++i) {
+        if (base[kRvaOperatorNew + i] != kOpNewPrologue[i]) return false;
+    }
+    INT32 rel = 0;
+    memcpy(&rel, base + kRvaOperatorNew + 9, sizeof(rel));
+    // call 目标必须是 0xbdbb6f（QQ 的分配器实现）
+    return static_cast<int64_t>(static_cast<int64_t>(kRvaOperatorNew) + 9 + 4 + rel) == 0xbdbb6fLL;
 }
 
 // 从这份布局里取回 (指针, 长度) —— 回读 out 结构时要用同一套规则。
@@ -1770,6 +1790,10 @@ static bool ssoBodyConvInstall() {
     if (!ssoReadable(callSite, 5)) return false;
     if (callSite[0] != 0xe8) return false;                       // 必须是 E8 rel32
 
+    // 长串 body 要经 QQ 的 operator new 分配：它的落点也必须过特征校验，
+    // 否则 arm 一个大 body 会把 24 字节布局写进一个错误函数的返回值上。
+    if (!ssoOperatorNewLooksRight(base)) return false;
+
     INT32 rel = 0;
     memcpy(&rel, base + kRvaBodyConvRelPos, sizeof(rel));
     const int64_t target = static_cast<int64_t>(kRvaBodyConvCall) + 5 + rel;
@@ -1831,6 +1855,24 @@ static bool ssoBodyConvRemove() {
     DWORD tmp = 0;
     VirtualProtect(base + kRvaBodyConvRelPos, sizeof(INT32), oldProt, &tmp);
     FlushInstructionCache(GetCurrentProcess(), base + kRvaBodyConvRelPos, sizeof(INT32));
+
+    // 跳板区一并还原成编译期的 0xCC 填充：install 覆盖过它，卸载时不还原
+    // 会让 .text 里留一段我们的代码，下次 install 的“必须是 padding”校验也会失败。
+    auto* const tramp = base + kRvaTrampSlot;
+    DWORD trampProt = 0;
+    if (ssoReadable(tramp, kTrampLen) && VirtualProtect(tramp, kTrampLen, PAGE_EXECUTE_READWRITE, &trampProt)) {
+        bool ours = tramp[0] == 0x48 && tramp[1] == 0xb8 && tramp[10] == 0xff && tramp[11] == 0xe0;
+        if (ours) {
+            memset(tramp, kTrampPadByte, kTrampLen);
+            DWORD trampTmp = 0;
+            VirtualProtect(tramp, kTrampLen, trampProt, &trampTmp);
+            FlushInstructionCache(GetCurrentProcess(), tramp, kTrampLen);
+        } else {
+            // 不是我们写的 12 字节（可能已被别的代码借用）——只还原 call，不动它。
+            DWORD trampTmp = 0;
+            VirtualProtect(tramp, kTrampLen, trampProt, &trampTmp);
+        }
+    }
     g_bodyConvPatched = false;
     return true;
 }
@@ -2151,6 +2193,13 @@ static void* ssoBodyConvCallback(void* env, void* info) {
         char hexBuf[65536] = {0};
         size_t hexLen = 0;
         if (argc >= 2 && argv[1]) g_sso.getStr(env, argv[1], hexBuf, sizeof(hexBuf) - 1, &hexLen);
+        // 截断检测：getStr 填满缓冲说明 JS 传的字符串比 65535 字符还长，
+        // 继续解析只会把一个被腰斩的 hex 当 body 静默发出畸形包 —— 明确拒绝。
+        if (hexLen == sizeof(hexBuf) - 1 && argc >= 2 && argv[1]) {
+            setB("ok", false);
+            setS("note", "bodyHex 超过 32767 字节上限，已拒绝（不会发出截断的畸形包）");
+            return out;
+        }
         size_t bodyLen = 0;
         for (size_t i = 0; i + 1 < hexLen && bodyLen < sizeof(g_bodyTakeover); i += 2) {
             const int hi = ssoHexNibble(hexBuf[i]);
@@ -2165,8 +2214,17 @@ static void* ssoBodyConvCallback(void* env, void* info) {
         if (!g_bodyConvPatched) setS("note", "补丁未安装，arm 不会生效（先 op=install）");
         return out;
     }
+    if (!strcmp(opBuf, "disarm")) {
+        // JS 侧 try/finally 的兜底：send 抛错没走到代劳时，armed 标志会残留，
+        // 下一次 QQ 自己的正常调用就会被误劫持。主动清掉，下次命中按原函数走。
+        InterlockedExchange(&g_bodyTakeoverActive, 0);
+        g_bodyTakeoverLen = 0;
+        setB("ok", true);
+        setB("armed", false);
+        return out;
+    }
     setB("ok", false);
-    setS("note", "op 必须是 install / remove / status / arm");
+    setS("note", "op 必须是 install / remove / status / arm / disarm");
     return out;
 }
 

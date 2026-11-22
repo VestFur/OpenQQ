@@ -182,7 +182,20 @@ function createActionHandler(session, self, current, options = {}) {
     return null;
   }
 
+  // arm 是全局单槽：两个并发 selfSsoSend 会互相覆盖 body（后 arm 的把先 arm 的顶掉）。
+  // JS 侧用一个 promise 链把所有 SSO 发送串行化 —— 同一时刻最多一个 arm 在飞。
+  let ssoChain = Promise.resolve();
+  const runSerialized = (job) => {
+    const next = ssoChain.then(job, job);   // 前一个失败不阻塞后一个
+    ssoChain = next.then(() => {}, () => {});
+    return next;
+  };
+
   async function selfSsoSend(cmd, bodyBuf) {
+    return runSerialized(() => selfSsoSendOnce(cmd, bodyBuf));
+  }
+
+  async function selfSsoSendOnce(cmd, bodyBuf) {
     const armFn = globalThis.__openqqSsoBodyConv;
     if (typeof armFn !== 'function') {
       return { ok: false, status: -1, note: '__openqqSsoBodyConv 不存在：需要新 bootstrap' };
@@ -192,6 +205,11 @@ function createActionHandler(session, self, current, options = {}) {
       return { ok: false, status: -1, note: 'body 代劳补丁未安装（bootstrap 启动时应自动装；失败说明 wrapper.node 版本不符）' };
     }
     const bytes = Buffer.isBuffer(bodyBuf) ? bodyBuf : Buffer.from(bodyBuf || []);
+    // arm 的 hex 缓冲上限是 65535 个字符（≈32767 字节 body）：超了会被静默截断，
+    // native 侧也会拒绝，这里先拦掉并给出明确错误，不让畸形包发出去。
+    if (bytes.length > 32767) {
+      return { ok: false, status: -1, note: `body 超过 32767 字节上限（当前 ${bytes.length}），已拒绝` };
+    }
 
     const once = async (name) => {
       const arm = armFn('arm', bytes.toString('hex'));
@@ -205,6 +223,10 @@ function createActionHandler(session, self, current, options = {}) {
       } catch (error) {
         return { ok: false, status: -1, ms: Date.now() - t0,
           note: 'sendSsoCmdReqByContend 抛错：' + String((error && error.message) || error).slice(0, 180) };
+      } finally {
+        // 正常路径 body 已被借走（native 自动清零）；send 抛错没借走时 armed 标志会残留，
+        // 会误劫持 QQ 下一次的正常调用 —— 无论成败都显式 disarm 兜底（重复 disarm 无害）。
+        try { armFn('disarm', ''); } catch { /* disarm 失败不影响本次结果 */ }
       }
       const ms = Date.now() - t0;
 
@@ -218,20 +240,27 @@ function createActionHandler(session, self, current, options = {}) {
       }
 
       // 解 OidbBase：1=command 2=subCommand 3=errorCode 4=body 5=errorMsg
+      // 整个手工 varint 解析包一层 try/catch：回包损坏时（越界/超长 varint）
+      // 要报错而不是把异常抛到调用方当成通道崩溃。
       const ob = {};
-      {
+      try {
         let i = 0;
         const rv = () => { let v = 0n, s = 0n, c; do { if (i >= resp.length) throw new Error('eof'); c = resp[i++]; v |= BigInt(c & 0x7f) << s; s += 7n; } while (c & 0x80); return v; };
         while (i < resp.length) {
           let t; try { t = Number(rv()); } catch { break; }
           const field = t >>> 3, wire = t & 7;
           if (wire === 0) { try { ob[field] = Number(rv()); } catch { break; } }
-          else if (wire === 2) { const n = Number(rv()); ob[field] = resp.subarray(i, i + n); i += n; }
+          else if (wire === 2) {
+            // 长度 varint 与子区间都做越界保护：截断的回包在这里结束解析。
+            let n; try { n = Number(rv()); } catch { break; }
+            if (!Number.isSafeInteger(n) || n < 0 || i + n > resp.length) break;
+            ob[field] = resp.subarray(i, i + n); i += n;
+          }
           else if (wire === 5) i += 4;
           else if (wire === 1) i += 8;
           else break;
         }
-      }
+      } catch { /* 已解析到的字段够用；损坏尾部按空回包处理 */ }
       // ⚠️ proto3 省略零值：errorCode==0 时 field3 根本不存在，不能拿 -1 当失败。
       // 另外 trpc 回包（群相册那类）没有 OidbBase 外壳，field3 可能是 bytes 而不是 varint ——
       // 这时它不是错误码，按 0 处理，否则会把成功显示成 errorCode=[object Object]。
@@ -244,7 +273,8 @@ function createActionHandler(session, self, current, options = {}) {
         // 统一成 Buffer，否则下游 .subarray/.length 会抛（get_pskey 就因此报过
         // `body.subarray is not a function`）。
         body: Buffer.isBuffer(ob[4]) ? ob[4] : Buffer.alloc(0),
-        errorMsg: ob[5] ? Buffer.from(ob[5]).toString('utf8') : '',
+        // field5 同理：只能是 bytes 才转字符串，Number/其它类型会害 Buffer.from 抛错。
+        errorMsg: Buffer.isBuffer(ob[5]) ? ob[5].toString('utf8') : '',
         response: resp,
         ms,
         cmdUsed: name,

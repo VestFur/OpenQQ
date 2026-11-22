@@ -55,8 +55,18 @@ static unsigned char* FindTrampoline(const unsigned char* base, const unsigned c
                     if (t) return t;
                 }
             }
-            if (regionEnd <= cur) break;
-            cur = regionEnd;
+            if (dir == 0) {
+                // 向上扫：跳到区域末端（高地址方向）
+                if (regionEnd <= cur) break;
+                cur = regionEnd;
+            } else {
+                // 向下扫：跳到区域起点（低地址方向）。
+                // 之前这里错写成 cur = regionEnd —— 向下扫却往高地址跳，
+                // 一旦首个查询区域不含空闲块就原地打转（上游 review 指出）。
+                const uintptr_t regionStart = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                if (regionStart >= cur) break;
+                cur = regionStart;
+            }
         }
     }
     return nullptr;
