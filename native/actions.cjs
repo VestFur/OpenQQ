@@ -138,8 +138,18 @@ const NATIVE_OPS = {
   delete_custom_face: { service: 'msg', method: 'deleteFavEmoji', arity: 1, build: p => [String(p.emoji_id ?? p.face_id ?? p.id ?? '')] },
   check_url_safely: { service: 'msg', method: 'checkMsgWithUrl', arity: 1, build: p => [{ url: String(p.url ?? p.text ?? '') }] },
   translate_en2zh: { service: 'RichMedia', method: 'translateEnWordToZn', arity: 1, build: p => [String(p.text ?? p.words ?? '')] },
-  set_qq_profile: { service: 'Profile', method: 'setNickName', arity: 1, build: p => [String(p.nickname ?? p.nick ?? '')] },
-  set_self_longnick: { service: 'Profile', method: 'setLongNick', arity: 1, build: p => [String(p.longNick ?? p.long_nick ?? p.sign ?? p.longnick ?? '')] },
+  set_qq_profile: { service: 'Profile', method: 'setNickName', arity: 1, build: p => {
+    // 空参调用会把昵称写成空串（QQ 回 result:0 看不出删了东西）——缺参数直接拒绝。
+    const nick = p.nickname ?? p.nick;
+    if (nick === undefined || nick === null || String(nick) === '') throw new Error('set_qq_profile 需要 nickname');
+    return [String(nick)];
+  } },
+  set_self_longnick: { service: 'Profile', method: 'setLongNick', arity: 1, build: p => {
+    // 同上：清空签名必须显式传空串，不传参数直接拒绝，避免误调用静默清空。
+    const sign = p.longNick ?? p.long_nick ?? p.sign ?? p.longnick;
+    if (sign === undefined || sign === null) throw new Error('set_self_longnick 需要 longNick（清空签名请显式传空串）');
+    return [String(sign)];
+  } },
   set_group_remark: { service: 'Group', method: 'modifyGroupRemark', arity: 2, build: p => [String(p.group_id ?? ''), String(p.remark ?? p.card ?? p.name ?? '')] },
   send_flash_msg: { service: 'FlashTransfer', method: 'sendFlashTransferMsg', arity: 1, build: p => {
       const heads = Array.isArray(p.heads) ? p.heads : [];
@@ -153,8 +163,7 @@ const NATIVE_OPS = {
   mark_group_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, build: p => [{ chatType: 2, peerUid: String(p.group_id ?? ''), guildId: '' }] },
   mark_private_msg_as_read: { service: 'msg', method: 'setMsgRead', arity: 1, needsUid: [[0, 'peerUid']], build: p => [{ chatType: 1, peerUid: String(p.user_id ?? ''), guildId: '' }] },
   set_msg_emoji_like: { service: 'msg', method: 'setMsgEmojiLikes', arity: 5, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    // `message_id` 是 OneBot 自增序号，不是 QQ 真 msgId（见 src/onebot.mjs 的 nextId++）。
+        // `message_id` 是 OneBot 自增序号，不是 QQ 真 msgId（见 src/onebot.mjs 的 nextId++）。
     // 真 msgId + peerUid 要从 `openqq_ref` 拿 —— 和 reply 段、get_forward_msg、forward_* 完全同一套机制。
     const ref = nativeRef(p.openqq_ref);
     const msgId = ref ? String(ref.msgId) : String(p.message_id ?? p.msg_id ?? '');
@@ -163,154 +172,116 @@ const NATIVE_OPS = {
     return [peer, msgId, String(p.emoji_id ?? p.emoji ?? ''), isSet ? 1 : 0, null];
   } },
   click_inline_button: { service: 'msg', method: 'clickInlineKeyboardButton', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ peer: nativePeerOf(p), msgId: String(p.message_id ?? ''), buttonId: String(p.button_id ?? p.id ?? '') }];
+        return [{ peer: nativePeerOf(p), msgId: String(p.message_id ?? ''), buttonId: String(p.button_id ?? p.id ?? '') }];
   } },
   click_tofu_button: { service: 'msg', method: 'clickTofuActionButton', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [nativePeerOf(p), String(p.message_id ?? ''), String(p.button_id ?? p.id ?? '')];
+        return [nativePeerOf(p), String(p.message_id ?? ''), String(p.button_id ?? p.id ?? '')];
   } },
   set_mark_unread: { service: 'msg', method: 'setMarkUnreadFlag', arity: 2, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [nativePeerOf(p), Boolean(p.unread ?? true)];
+        return [nativePeerOf(p), Boolean(p.unread ?? true)];
   } },
   like_or_dislike_report: { service: 'msg', method: 'likeOrDislikeReportForMsg', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [nativePeerOf(p), String(p.message_id ?? ''), Number(p.like ?? 1)];
+        return [nativePeerOf(p), String(p.message_id ?? ''), Number(p.like ?? 1)];
   } },
   translate_ptt_to_text: { service: 'msg', method: 'translatePtt2Text', arity: 3, cbIndex: 2, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [nativePeerOf(p), String(p.message_id ?? ''), {}];
+        return [nativePeerOf(p), String(p.message_id ?? ''), {}];
   } },
   recall_nudge: { service: 'msg', method: 'recallNudge', arity: 2, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [nativePeerOf(p), String(p.message_id ?? '')];
+        return [nativePeerOf(p), String(p.message_id ?? '')];
   } },
   add_group_essence: { service: 'Group', method: 'addGroupEssence', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), msgSeq: String(p.message_seq ?? p.msg_seq ?? ''), msgRandom: String(p.message_random ?? p.msg_random ?? '') }];
+        return [{ groupCode: String(p.group_id ?? ''), msgSeq: String(p.message_seq ?? p.msg_seq ?? ''), msgRandom: String(p.message_random ?? p.msg_random ?? '') }];
   } },
   remove_group_essence: { service: 'Group', method: 'removeGroupEssence', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), msgSeq: String(p.message_seq ?? p.msg_seq ?? ''), msgRandom: String(p.message_random ?? p.msg_random ?? '') }];
+        return [{ groupCode: String(p.group_id ?? ''), msgSeq: String(p.message_seq ?? p.msg_seq ?? ''), msgRandom: String(p.message_random ?? p.msg_random ?? '') }];
   } },
   publish_group_bulletin: { service: 'Group', method: 'publishGroupBulletin', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), content: String(p.content ?? p.text ?? '') }, String(p.content ?? p.text ?? ''), {}];
+        return [{ groupCode: String(p.group_id ?? ''), content: String(p.content ?? p.text ?? '') }, String(p.content ?? p.text ?? ''), {}];
   } },
   delete_group_bulletin: { service: 'Group', method: 'deleteGroupBulletin', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), null];
+        return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), null];
   } },
   remind_group_bulletin_read: { service: 'Group', method: 'remindGroupBulletinRead', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), null];
+        return [String(p.group_id ?? ''), String(p.bulletin_id ?? p.feed_id ?? ''), null];
   } },
   add_group_tag: { service: 'Group', method: 'addGroupTagToCategory', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    // 实测：字段名必须是 name（传 tag / tagName / tags 一律回 200012 "tag name is empty"）
+        // 实测：字段名必须是 name（传 tag / tagName / tags 一律回 200012 "tag name is empty"）
     return [{ groupCode: String(p.group_id ?? ''), name: String(p.name ?? p.tag ?? '') }];
   } },
   remove_group_tag: { service: 'Group', method: 'removeGroupTagFromCategory', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), name: String(p.name ?? p.tag ?? '') }];
+        return [{ groupCode: String(p.group_id ?? ''), name: String(p.name ?? p.tag ?? '') }];
   } },
   save_ai_voice: { service: 'Group', method: 'saveAIVoice', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), voiceId: String(p.voice_id ?? ''), voiceName: String(p.voice_name ?? '') }];
+        return [{ groupCode: String(p.group_id ?? ''), voiceId: String(p.voice_id ?? ''), voiceName: String(p.voice_name ?? '') }];
   } },
   approval_friend_request: { service: 'Buddy', method: 'approvalFriendRequest', arity: 1, needsUid: [[0, 'friendUid']], build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ friendUid: String(p.uid ?? p.user_id ?? p.uin ?? ''), reqTime: String(p.flag ?? p.req_time ?? ''), accept: Boolean(p.approve ?? true) }];
+        return [{ friendUid: String(p.uid ?? p.user_id ?? p.uin ?? ''), reqTime: String(p.flag ?? p.req_time ?? ''), accept: Boolean(p.approve ?? true) }];
   } },
   approval_doubt_buddy: { service: 'Buddy', method: 'approvalDoubtBuddyReq', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.uin ?? p.user_id ?? ''), Boolean(p.approve ?? true), null];
+        return [String(p.uin ?? p.user_id ?? ''), Boolean(p.approve ?? true), null];
   } },
   del_buddy: { service: 'Buddy', method: 'delBuddy', arity: 1, needsUid: [[0, 'friendUid']], build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ friendUid: String(p.user_id ?? p.uin ?? '') }];
+        return [{ friendUid: String(p.user_id ?? p.uin ?? '') }];
   } },
   set_buddy_remark: { service: 'Buddy', method: 'setBuddyRemark', arity: 1, needsUid: [[0, 'uid']], build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ uid: String(p.user_id ?? p.uin ?? ''), remark: String(p.remark ?? '') }];
+        return [{ uid: String(p.user_id ?? p.uin ?? ''), remark: String(p.remark ?? '') }];
   } },
   req_to_add_friends: { service: 'Buddy', method: 'reqToAddFriends', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ uin: String(p.user_id ?? p.uin ?? ''), msg: String(p.comment ?? p.message ?? '') }];
+        return [{ uin: String(p.user_id ?? p.uin ?? ''), msg: String(p.comment ?? p.message ?? '') }];
   } },
   set_like_status: { service: 'OnlineStatus', method: 'setLikeStatus', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ uin: String(p.user_id ?? p.uin ?? ''), status: Number(p.status ?? 0) }];
+        return [{ uin: String(p.user_id ?? p.uin ?? ''), status: Number(p.status ?? 0) }];
   } },
   check_like_status: { service: 'OnlineStatus', method: 'checkLikeStatus', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ uin: String(p.user_id ?? p.uin ?? '') }];
+        return [{ uin: String(p.user_id ?? p.uin ?? '') }];
   } },
   do_qun_like: { service: 'Album', method: 'doQunLike', arity: 5, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), String(p.uin ?? ''), Number(p.count ?? 1), String(p.cookie ?? ''), null];
+        return [String(p.group_id ?? ''), String(p.uin ?? ''), Number(p.count ?? 1), String(p.cookie ?? ''), null];
   } },
   trans_group_file: { service: 'RichMedia', method: 'transGroupFile', arity: 2, cbIndex: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), fileId: String(p.file_id ?? ''), busId: Number(p.bus_id ?? 102) }, null];
+        return [{ groupCode: String(p.group_id ?? ''), fileId: String(p.file_id ?? ''), busId: Number(p.bus_id ?? 102) }, null];
   } },
   rename_group_file: { service: 'RichMedia', method: 'renameGroupFile', arity: 5, cbIndex: 4, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), String(p.file_id ?? ''), String(p.new_name ?? p.name ?? ''), Number(p.bus_id ?? 102), null];
+        return [String(p.group_id ?? ''), String(p.file_id ?? ''), String(p.new_name ?? p.name ?? ''), Number(p.bus_id ?? 102), null];
   } },
   image_translate: { service: 'RichMedia', method: 'imageTranslate', arity: 3, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.image_path ?? p.file ?? ''), String(p.source_lang ?? 'auto'), String(p.target_lang ?? 'zh')];
+        return [String(p.image_path ?? p.file ?? ''), String(p.source_lang ?? 'auto'), String(p.target_lang ?? 'zh')];
   } },
   clear_group_notifies: { service: 'Group', method: 'clearGroupNotifies', arity: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
+        return [{ groupCode: String(p.group_id ?? ''), reqType: Number(p.req_type ?? 0) }];
   } },
   operate_sys_notify: { service: 'Group', method: 'operateSysNotify', arity: 2, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ groupCode: String(p.group_id ?? ''), notifySeq: String(p.seq ?? p.flag ?? ''), accept: Boolean(p.approve ?? true) }, {}];
+        return [{ groupCode: String(p.group_id ?? ''), notifySeq: String(p.seq ?? p.flag ?? ''), accept: Boolean(p.approve ?? true) }, {}];
   } },
   invite_to_group: { service: 'Group', method: 'inviteToGroup', arity: 2, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.group_id ?? ''), Array.isArray(p.user_ids) ? p.user_ids.map(String) : [String(p.user_id ?? '')]];
+        return [String(p.group_id ?? ''), Array.isArray(p.user_ids) ? p.user_ids.map(String) : [String(p.user_id ?? '')]];
   } },
   del_buddy_req: { service: 'Buddy', method: 'delBuddyReq', arity: 1, needsUid: [[0, 'friendUid']], build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ friendUid: String(p.uid ?? p.user_id ?? ''), reqTime: String(p.flag ?? '') }];
+        return [{ friendUid: String(p.uid ?? p.user_id ?? ''), reqTime: String(p.flag ?? '') }];
   } },
   set_block: { service: 'Buddy', method: 'setBlock', arity: 2, needsUid: [0], build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.uid ?? p.user_id ?? ''), Boolean(p.block ?? true)];
+        return [String(p.uid ?? p.user_id ?? ''), Boolean(p.block ?? true)];
   } },
   is_blocked: { service: 'Buddy', method: 'isBlocked', arity: 1, needsUid: [0], build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [String(p.uid ?? p.user_id ?? '')];
+        return [String(p.uid ?? p.user_id ?? '')];
   } },
   upload_file_stream: { service: 'RichMedia', method: 'onlyUploadFile', arity: 2, cbIndex: 1, build: p => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ filePath: String(p.file ?? p.path ?? ''), fileName: String(p.name ?? '') }, null];
+        return [{ filePath: String(p.file ?? p.path ?? ''), fileName: String(p.name ?? '') }, null];
   } },
   add_custom_face_legacy: { service: 'Msg', method: 'addFavEmoji', arity: 1, build: (p) => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    return [{ emojiId: String(p.emoji_id ?? p.emoji ?? p.file_id ?? ''), isOrigin: 1 }];
+        return [{ emojiId: String(p.emoji_id ?? p.emoji ?? p.file_id ?? ''), isOrigin: 1 }];
   } },
   // ⚠️ 内核里只有 Avatar.forceDownloadGroupPortrait —— 那是「下载/刷新群头像」，**不是设置**。
   // 以前把它当成 set 用，调了回 result:0，看起来成功，实际群头像没变。
   // 设置群头像要先把图片传上去再走 OIDB（我们还没接），所以这里如实说明，不要假装成功。
   set_group_portrait: { service: 'Avatar', method: 'forceDownloadGroupPortrait', arity: 3, cbIndex: 2, build: (p) => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    throw new Error('QQ 内核只有「下载/刷新群头像」(forceDownloadGroupPortrait)，没有设置群头像的方法。'
+        throw new Error('QQ 内核只有「下载/刷新群头像」(forceDownloadGroupPortrait)，没有设置群头像的方法。'
       + '设置群头像需要先上传图片再走 OIDB，这条通道还没实现；这个动作现在不会改动群头像，请不要以为它生效了');
   } },
   // addCollection 只收一个对象。以前恒传 [{}]，等于把所有入参都丢掉，调用方给什么都一样。
   create_collection: { service: 'Collection', method: 'addCollection', arity: 1, build: (p) => {
-    if (Array.isArray(p.raw_args)) return p.raw_args;
-    const payload = {};
-    for (const [key, value] of Object.entries(p || {})) {
-      if (key === 'raw_args') continue;
-      payload[key] = value;
-    }
+        const payload = {};
+    for (const [key, value] of Object.entries(p || {})) payload[key] = value;
     return [payload];
   } },
 };
