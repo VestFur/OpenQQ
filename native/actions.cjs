@@ -394,10 +394,14 @@ function createActionHandler(session, self, current, options = {}) {
       return await Promise.race([cancelled, (async () => {
         if (action.kind === 'oidb_dryrun') {
       // 只回报将要发送的字节，不发 —— 调用方看 sent:false 就知道没有副作用。
-      return { status: 'failed', retcode: 1404, data: {
+      // 必须走 throw：session.cjs 会把 return 值统一包成 retcode 0，
+      // 之前返回 { status:'failed', retcode:1404 } 在 main 上被包成成功。
+      const err = fail('危险动作（不可撤回且影响他人）：默认只构造不发送。确认要真发时传 confirm_danger: true', 1404);
+      err.data = {
         action: action.action, cmd: action.cmd, bodyHex: action.bodyHex,
         bodyLen: action.bodyLen, sent: false, note: action.note,
-      } };
+      };
+      throw err;
     }
     if (action.kind === 'sso_pipe') {
       // 声明了 needsUid 的 OIDB 动作在这里才编码：先把它的字段从 QQ 号换成 NT UID。

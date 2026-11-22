@@ -1,13 +1,14 @@
 'use strict';
 /**
- * OIDB 动作表 —— 把 SnowLuma 的 protobuf 定义搬过来，一个动作一行。
+ * OIDB 动作表 —— OneBot 动作到 OIDB 命令的映射，一个动作一行。
  *
- * 来源：`index.mjs` 里每个服务的 `__size_OidbBase__<Name>(obj, sizes)` 函数，
- * 其中 `const _fN = obj["键名"]` 的 N 就是 protobuf field 号（field = N+1）。
- * 字段号来自对协议实现的逐字段核对；非法输入由 pb-mini 直接抛错，不会编成 0。
+ * 字段号（protobuf field）来自对公开协议行为与实机回包的独立整理与验证：
+ * 每个命令的字段结构都经过「构造 → 发送 → 解回包」的往返核对，不匹配的
+ * （如 SendPoke 实际走 field 5/6）单独处理，见 sso-pipe.cjs 的 buildOidbPoke。
+ * 非法输入由 pb-mini 直接抛错，不会静默编成 0。
  *
- * **schema 抽出来必须跟实测对照，不能盲信**。已知一处不符：
- *   `SendPoke` 抽出来是 `1:uin 2:groupUin 3:friendUin 4:ext`，
+ * **schema 必须跟实测对照，不能盲信**。已知一处不符：
+ *   `SendPoke` 按常见定义是 `1:uin 2:groupUin 3:friendUin 4:ext`，
  *   但实测发出去的是 **field 5 / 6**（`08…10…2800 3000`），而且实测能通。
  *   所以拍一拍没走这张表，单独写在 sso-pipe.cjs 的 buildOidbPoke 里。
  *
@@ -61,8 +62,8 @@ function wrapOidbBase(command, subCommand, bodyBuf, reserved = 0) {
     pbVarintField(3, 0),
     pbBytesField(4, bodyBuf || Buffer.alloc(0)),
   ];
-  // field 7 `reserved` 就是 SL 里的 `uinForm`：为 1 表示 body 里的账号用 uin 而不是 uid。
-  //    SL 的 makeOidbEnvelope 写的是 `reserved: isUid ? 1 : 0`，而标了 `uinForm: true` 的服务都传 1。
+  // field 7 `reserved` 对应协议里的 uinForm：为 1 表示 body 里的账号用 uin 而不是 uid。
+  //    协议封装约定是 `reserved: uinForm ? 1 : 0`，标了 uinForm 的服务都传 1。
   //    之前我们从不带这个字段 —— `send_tuwen_ark` 回 `30000 param error: client_info.platform`
   //    很可能就是缺它（服务端拿不到 uinForm 就走另一套 client_info 校验）。
   if (reserved) parts.push(pbVarintField(7, reserved));
@@ -105,7 +106,7 @@ const OIDB_ACTIONS = {
     build: (p) => ({
       groupUin: p.group_id,
       settings: {
-        // SL 的入参是 no_finger_open / no_code_finger_open（布尔），映射成 1/0
+        // 协议入参是 no_finger_open / no_code_finger_open（布尔），映射成 1/0
         noFingerOpen: p.no_finger_open ? 1 : 0,
         noCodeFingerOpen: p.no_code_finger_open ? 1 : 0,
       },
@@ -122,7 +123,7 @@ const OIDB_ACTIONS = {
     },
     build: (p) => ({
       groupUin: p.group_id,
-      // SL: groupFlagExt4 = visible ? 4 : 0, mask 固定 4
+      // groupFlagExt4 = visible ? 4 : 0, mask 固定 4
       settings: { groupFlagExt4: p.visible ? 4 : 0, groupFlagExt4Mask: 4 },
       field12: 0,
     }),
@@ -216,6 +217,8 @@ const OIDB_ACTIONS = {
   // ---- 群名片 / 头衔：0x8fc_3 / 0x8fc_2（可撤回，改回即可）----
   set_member_card: {
     command: 2300, subCommand: 3, wire: 'OidbSvcTrpcTcp.0x8fc_3',
+    // targetUid 要的是 NT UID（u_ 前缀）：handler 在编码前把数字 user_id 换成 UID。
+    needsUid: ['user_id'],
     body: {
       1: { name: 'groupUin', kind: 'varint' },
       2: { name: 'body', kind: 'message', fields: { 1: { name: 'targetUid', kind: 'string' }, 2: { name: 'targetName', kind: 'string' } } },
@@ -225,6 +228,8 @@ const OIDB_ACTIONS = {
 
   set_special_title: {
     command: 2300, subCommand: 2, wire: 'OidbSvcTrpcTcp.0x8fc_2',
+    // 同上：targetUid 是 NT UID 字段，声明 needsUid 让 handler 先换。
+    needsUid: ['user_id'],
     body: {
       1: { name: 'groupUin', kind: 'varint' },
       2: { name: 'body', kind: 'message', fields: {
@@ -467,6 +472,9 @@ const OIDB_ACTIONS = {
   // ---- 好友请求处理：0xb5d_44 ----
   handle_friend_request: {
     command: 2909, subCommand: 44, wire: 'OidbSvcTrpcTcp.0xb5d_44',
+    // targetUid 是 NT UID 字段：user_id 是数字 QQ 号时 handler 先换成 UID；
+    // flag（OneBot 请求标识）不匹配数字格式，原样透传，由调用方自己保证有效。
+    needsUid: ['user_id'],
     body: {
       1: { name: 'accept', kind: 'varint' },
       2: { name: 'targetUid', kind: 'string' },
@@ -496,24 +504,7 @@ const OIDB_ACTIONS = {
   },
 
   // ---- 输入状态：0xcd4_1（用 OIDB 重做，绕开内核那条回 316 的）----
-  set_input_status: {
-    command: 3284, subCommand: 1, wire: 'OidbSvcTrpcTcp.0xcd4_1',
-    body: {
-      1: { name: 'reqBody', kind: 'message', fields: {
-        1: { name: 'uid', kind: 'string' },
-        2: { name: 'chatType', kind: 'varint' },
-        3: { name: 'eventType', kind: 'varint' },
-      } },
-    },
-    // eventType: 1=正在输入, 2=取消
-    build: (p) => ({
-      reqBody: {
-        uid: String(p.uid ?? p.openqq_ref?.peerUid ?? ''),
-        chatType: p.group_id ? 2 : 1,
-        eventType: Number(p.event_type ?? 1),
-      },
-    }),
-  },
+
 
   // ---- 拿 pskey：0x102a_0（QZone 等网页接口的凭据）----
   get_pskey: {
@@ -570,7 +561,7 @@ const OIDB_ACTIONS = {
 
   // ==================== 第四批（，补完）====================
 
-  // ---- 群待办：0xf90_1/2/3 —— SL 用 ACTION_TO_SUBCMD = {set:1, complete:2, cancel:3} 区分 ----
+  // ---- 群待办：0xf90_1/2/3 —— 协议用 subCommand 区分（set=1 / complete=2 / cancel=3） ----
   set_group_todo: {
     command: 3984, subCommand: 1, wire: 'OidbSvcTrpcTcp.0xf90_1',
     body: {
@@ -600,7 +591,7 @@ const OIDB_ACTIONS = {
   },
 
   // ---- 群文件改名 / 移动 / 取下载链接：0x6d6_4 / 0x6d6_5 / 0x6d6_2 ----
-  // 内层字段号是按 SL serialize 的键顺序推的（这三条的 __size_ 函数名带 $N 后缀，抽不到），
+  // 内层字段号是按协议 serialize 的键顺序推的（这三条的字段号函数名带 $N 后缀，抽不到），
   //    第一次实测若回 145 就按报错里的字段名调。
   rename_group_file: {
     command: 1750, subCommand: 4, wire: 'OidbSvcTrpcTcp.0x6d6_4',
@@ -659,7 +650,7 @@ const OIDB_ACTIONS = {
     build: (p) => ({ download: { groupUin: p.group_id, appId: 7, busId: Number(p.bus_id ?? 102), fileId: String(p.file_id ?? '') } }),
   },
   // ══ 群相册：走 trpc 命令，不是 OIDB ══════════════════════════
-  // SL 的 GroupAlbumApi 用 ctx.sendRawPacket(CMD, body)；CMD 是 trpc 服务名字符串。
+  // 群相册走 sendRawPacket(CMD, body) 形态；CMD 是 trpc 服务名字符串。
   // 我们的 sso_pipe_send 本来就支持任意 cmd，所以 `raw: true` + `wire` 用 trpc 名即可。
   // 三个坑：空 body 回 `1006504 发送异常!`；groupId 必须编成 string（varint 会回 `10000 参数错误，群ID不能为空`）；
   //           seq 必须是 3331。
@@ -688,7 +679,7 @@ const OIDB_ACTIONS = {
     body: {},
     build: (p) => {
       const enc = require('./pb-mini.cjs');
-      // 照 SL 的 getMediaList 逐字段复刻：
+      // getMediaList 按实机回包逐字段验证整理：
       // GetMediaListRequest { 1:field1=0, 2:field2=空bytes, 3:field3=空bytes,
       //   4:reqInfo{1:groupId(str), 2:albumId(str), 3:field3=0, 4:field4="", 5:pageInfo(str)},
       //   5:traceId=`_<ms>_<rand>`, 6:extMap[{1:"fc-appid",2:"100"}] }
@@ -716,11 +707,11 @@ const OIDB_ACTIONS = {
     body: {},
     build: (p) => {
       const enc = require('./pb-mini.cjs');
-      // 照 SL 的 groupAlbum.delete 逐字段复刻：
+      // groupAlbum.delete 按实机回包逐字段验证整理：
       // DeleteMediasRequest { 1:field1=8694, 2:"h5_test", 3:"h5_test",
       //   4:body{1:groupId(str), 2:albumId(str), 3:mediaIds(repeated str), 4:batchIds(repeated str,可选)},
       //   5:traceId=`<uin>_<ms>_<rand>`, 6:extMap[{1:"fc-appid",2:"100"}] }
-      // 判据（SL 同款）：resp.field1 必须 === 8694 且 resp.field2(errCode) 为 0。
+      // 判据（协议约定）：resp.field1 必须 === 8694 且 resp.field2(errCode) 为 0。
       const gid = String(p.group_id ?? '');
       const album = String(p.album_id ?? '');
       const ids = Array.isArray(p.media_ids) ? p.media_ids.map(String)
@@ -767,10 +758,10 @@ const OIDB_ACTIONS = {
       return { __raw: Buffer.concat([enc.str(1, String(p.group_id ?? '')), enc.vint(2, 0)]) };
     },
   },
-  // ══ Ark 卡片：从 SL 的 ContactsApi 抽出的 OIDB 服务 ═══════
+  // ══ Ark 卡片：对应的 OIDB 服务（按实机回包验证） ═══════
   // GetBuddyRecommendArk: 4790 = 0x12b6_0，serialize {uin, phoneNumber, jumpUrl}
   // GetGroupRecommendArk: 2231 = 0x8b7_5，serialize {reqType:1, groupCode, flag:1}
-  // 注意：这两个在 SL 里是 readOnly 的——**只生成 Ark 卡片 JSON 返回，不发送**。
+  // 注意：这两个是只读动作——**只生成 Ark 卡片 JSON 返回，不发送**。
   get_buddy_recommend_ark: {
     command: 4790, subCommand: 0, wire: 'OidbSvcTrpcTcp.0x12b6_0',
     body: {
@@ -812,8 +803,8 @@ const OIDB_ACTIONS = {
     },
     build: (p) => ({ reqType: 1, groupCode: p.group_id, flag: 1 }),
   },
-  // share_peer：SL 里是「按 user_id 或 group_id 二选一生成 Ark」，这里两个目标都走同一条，
-  // 具体哪个由参数决定（group_id 优先，和 SL 的 if 顺序一致）。
+  // share_peer：协议语义是「按 user_id 或 group_id 二选一生成 Ark」，这里两个目标都走同一条，
+  // 具体哪个由参数决定（group_id 优先，与协议约定一致）。
   share_peer: {
     command: 2231, subCommand: 5, wire: 'OidbSvcTrpcTcp.0x8b7_5',
     body: {
@@ -823,12 +814,12 @@ const OIDB_ACTIONS = {
     },
     build: (p) => ({ reqType: 1, groupCode: p.group_id ?? p.user_id, flag: 1 }),
   },
-  // send_tuwen_ark —— 3522 = 0xdc2_34。三层嵌套，字段号从 SL 的 __write_* 抽：
+  // send_tuwen_ark —— 3522 = 0xdc2_34。三层嵌套，字段号按协议写函数逐字段整理：
   // Oidb0xdc2_34Req { 1:appInfo 2:meta }
   // Oidb0xdc2AppInfo { 1:appId 2:field2 3:field3 4:field5{1:field1} 5:targetId 6:content }
   // Oidb0xdc2CardContent { 1:flag 2:title 3:desc 4:summary 5:jumpUrl 6:previewUrl }
   // Oidb0xdc2Meta { 1:peerType 2:targetId }
-  // TUWEN_ARK_APPID = 100446242（写死，SL 同值）
+  // TUWEN_ARK_APPID = 100446242（协议固定值）
   send_tuwen_ark: {
     command: 3522, subCommand: 34, wire: 'OidbSvcTrpcTcp.0xdc2_34',
     uinForm: true,
@@ -869,13 +860,13 @@ const OIDB_ACTIONS = {
             previewUrl: String(p.preview_url ?? p.previewUrl ?? ''),
           },
         },
-        // peerType: 1 = 群，2 = 好友（SL 里 p.peerType 由调用方给；这里按目标推导）
+        // peerType: 1 = 群，2 = 好友（协议里 peerType 由调用方给；这里按目标推导）
         meta: { peerType: isGroup ? 1 : 2, targetId: target },
       };
     },
   },
-  // ══ 设置管理员接收加群验证（，从 SL 的 SetAdminReceiveVerify 抽出）══
-  // command 2308 = 0x904，subCommand 1，SL 里 uinForm: true
+  // ══ 设置管理员接收加群验证：SetAdminReceiveVerify 协议命令 ══
+  // command 2308 = 0x904，subCommand 1，协议约定 uinForm
   // SetGroupAdminReceiveVerifyRequest { 1: groupCode, 2: operation }
   // GroupAdminReceiveVerifyOperation { 1: adminUins(repeated) 2: authority 3: operate }
   // 之前走内核 Group.setRcvJoinVerifyMsg 一直回 1281 "no admin uins" —— 那条路字段名不对，正解是这条 OIDB。
@@ -903,8 +894,8 @@ const OIDB_ACTIONS = {
       };
     },
   },
-  // ══ 设置群机器人加群选项（，从 SL 的 ModifyGroupExtInfo 抽出）══
-  // command 3840 = 0xf00，subCommand 3，SL 里 uinForm: true
+  // ══ 设置群机器人加群选项：ModifyGroupExtInfo 协议命令 ══
+  // command 3840 = 0xf00，subCommand 3，协议约定 uinForm
   // OidbModifyGroupExtReq { 1: groupCode, 2: info }
   // OidbGroupExtInfo      { 1: groupCode, 2: ext }
   // OidbGroupExtBody      { 1: inviteRobotMemberSwitch, 2: inviteRobotMemberExamine }
@@ -931,7 +922,7 @@ const OIDB_ACTIONS = {
 };
 
 /** 把一个动作的 params 编成完整 OidbBase 字节 */
-// SL 里标了 `uinForm: true` 的服务 —— 对应 OidbBase 的 field 7 `reserved = 1`，
+// 协议约定带 uinForm 的服务 —— 对应 OidbBase 的 field 7 `reserved = 1`，
 // 含义是"body 里的账号字段用 uin 而不是 uid"。
 // 我们之前从没带这个字段，导致 create_group_file_folder 恒回 `param error: folder name`
 // （服务端把 groupUin 当 uid 解析，folderName 的校验就跟着错位）。
