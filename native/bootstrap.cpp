@@ -1,4 +1,4 @@
-﻿#include "bootstrap.hpp"
+#include "bootstrap.hpp"
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
@@ -1597,9 +1597,13 @@ static void notifySsoLocalSession(void* session) {
 struct SsoCmdSlot { char key[96]; alignas(16) unsigned char block[0x30]; };
 static SsoCmdSlot g_ssoCmd[64];
 static int g_ssoCmdCount = 0;
+// g_ssoHex / g_ssoReplyHex 只服务 __openqqSsoSend 那条已废弃的直发路，跟正式功能无关；
+// 它们各占 128 KB 静态空间，一起收进调试版。g_ssoBody 是 body 代劳补丁要用的，留着。
+#if defined(OPENQQ_ENABLE_PROBE)
 static char g_ssoHex[131072];
-static unsigned char g_ssoBody[65536];
 static char g_ssoReplyHex[131073];
+#endif
+static unsigned char g_ssoBody[65536];
 alignas(16) static unsigned char g_ssoReply[32];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2271,6 +2275,12 @@ struct SsoFunc { unsigned char storage[0x10]; void* invoke; void* destroy; };
 }
 #endif  // OPENQQ_ENABLE_PROBE（SsoSendRaw）
 
+// __openqqSsoSend：废弃的「native 直发」实验入口。
+// 它里面有一个 rawSessionMode —— argv[0] 传十进制地址字符串就能当 session 直接解引用，
+// 属于不该出现在发布版里的高危面；而且这条直发路本身已被证明会卡死 IPC
+// （见 .botharness/sl-re/PLAN-sso-local.md），正式功能走的是 ssoBodyConv 补丁那条。
+// 所以整段收进调试版。
+#if defined(OPENQQ_ENABLE_PROBE)
 static void* ssoSendCallback(void* env, void* info) {
     void* out = nullptr;
     g_sso.createObject(env, &out);
@@ -2507,6 +2517,7 @@ static void* ssoSendCallback(void* env, void* info) {
     setStr("note", "已提交到工作线程，本动作不再等待结果（避免堵住消息循环）");
     return out;
 }
+#endif  // OPENQQ_ENABLE_PROBE（SsoSend 直发实验）
 
 static void installSsoSend(HMODULE runtime, void* env, void* globalObject) {
     g_sso.getCbInfo = reinterpret_cast<decltype(g_sso.getCbInfo)>(GetProcAddress(runtime, "napi_get_cb_info"));
@@ -2538,6 +2549,7 @@ static void installSsoSend(HMODULE runtime, void* env, void* globalObject) {
             g_sso.setNamed(env, globalObject, "__openqqSsoBodyConv", bodyConvFn);
         }
     }
+    #if defined(OPENQQ_ENABLE_PROBE)
     void* fn = nullptr;
     if (g_sso.createFunction(env, "openqqSsoSend", SIZE_MAX,
                              reinterpret_cast<void*>(&ssoSendCallback), nullptr, &fn) == 0 && fn) {
@@ -2552,6 +2564,7 @@ static void installSsoSend(HMODULE runtime, void* env, void* globalObject) {
         }
 #endif  // OPENQQ_ENABLE_PROBE（SsoSendRaw 注册）
     }
+#endif  // OPENQQ_ENABLE_PROBE（SsoSend 注册）
 }
 
 extern "C" __declspec(dllexport) void* OpenQQBootstrap(void* env, void* exports, BootstrapConfig* config) {
