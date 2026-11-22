@@ -173,6 +173,15 @@ function createActionHandler(session, self, current, options = {}) {
   // 我们只负责告诉它"这一次 body 用我的字节"（arm），然后调 QQ 自己的
   // Msg.sendSsoCmdReqByContend —— 包由 QQ 发、回包也由 QQ 收，不做任何内存扫描。
   // 同一条命令在两个服务名前缀下可达性不同（有的会静默丢包），空回包时换另一个前缀再试一次。
+  function altSsoCmdName(cmd) {
+    const s = String(cmd || '');
+    let m = /^OidbSvcTrpcTcp\.(0x[0-9a-f]+_\d+)$/i.exec(s);
+    if (m) return 'OidbSvc.' + m[1];
+    m = /^OidbSvc\.(0x[0-9a-f]+_\d+)$/i.exec(s);
+    if (m) return 'OidbSvcTrpcTcp.' + m[1];
+    return null;
+  }
+
   async function selfSsoSend(cmd, bodyBuf) {
     const armFn = globalThis.__openqqSsoBodyConv;
     if (typeof armFn !== 'function') {
